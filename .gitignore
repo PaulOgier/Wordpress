@@ -1,0 +1,13 @@
+.DS_Store
+.obsidian/
+.claude/
+**/__pycache__/
+*.pyc
+
+# Repo-local memory and lessons (Claude worklog + knowledge).
+# Backed up to Drive via /backup, never shipped to GitHub.
+memory/
+
+# Audit run data: real client hostnames, findings and document URLs,
+# and the raw JSON behind them. This repo is public.
+wp_audit_runs/
