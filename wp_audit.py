@@ -43,7 +43,7 @@ jurisdictions. See "Safety posture" below for what this does and does not do.
 Author:       Paul Ogier
 Created:      2026-09-03
 Updated:      2026-09-03
-Version:      1.1.0
+Version:      1.2.0
 Status:       Production
 Python:       3.9+
 Dependencies: Stdlib only. `dig` is used for DNS when present, with a
@@ -147,6 +147,30 @@ reason this tool exists rather than a `curl` loop.
      API has and reports a plugin pulled from the directory for a security
      issue as merely "not in the directory". The body decides, not the
      status.
+ 15. The REST index is bigger than a page: 523 KB to 2.2 MB on four large
+     sites. Read with the page-size cap it truncates, fails to parse, and was
+     reported as "empty, the safer state" on every site with many plugins.
+     It has its own cap, and a truncated body is flagged rather than absent.
+ 16. A hostname whose every path redirects to another site is not that site.
+     One run described the other site's homepage as this host's wp-cron.php.
+     A www/bare pair is adopted; any other host is refused with the address
+     to use instead.
+ 17. A bundled library's version is not the core version. jquery.min.js
+     carries ?ver=3.7.1, and read as core that became "WordPress 3.7.1 with
+     450 published vulnerabilities". Only files WordPress enqueues with
+     $wp_version count, and only to corroborate the generator tag or feed.
+ 18. A 429 is a request to slow down, not a closed door. A CDN rate-limited
+     the path sweep at three requests a second and the run reported the REST
+     index as "not readable, the safer state". The tool now pauses, retries
+     once, slows the rest of the run, and labels anything still refused as
+     rate limited.
+ 19. A 200 with the wrong content is not the file. A WAF page at
+     /wp-admin/install.php contains neither "Already Installed" nor the
+     install form; requiring the form is what keeps it out of the HIGH table.
+ 20. A site that is not WordPress must be told apart from a hardened one.
+     Without platform detection, six modules reported "empty, the safer
+     state" on a static site. They are marked not applicable instead, and the
+     report's first line says so.
 
 Example usage:
 
@@ -191,7 +215,7 @@ from typing import Dict, List, Optional, Tuple
 # CONFIGURATION
 ###############################################################################
 
-SCRIPT_VERSION = "1.1.0"
+SCRIPT_VERSION = "1.2.0"
 
 # [OPTIONAL] Startup check against the remote VERSION file. Fail-silent.
 CHECK_FOR_UPDATES = True
@@ -215,6 +239,11 @@ OUTPUT_DIRECTORY = Path("./wp_audit_runs")
 REQUEST_DELAY = 0.15         # seconds between requests
 REQUEST_TIMEOUT = 25         # seconds per request
 MAX_BODY_BYTES = 400_000     # per response; enough to fingerprint any page
+# The REST index is the one response that is routinely larger than a page.
+# Measured on four large sites: 523 KB, 585 KB, 781 KB and 2.2 MB. Reading it
+# with the page cap truncated the JSON, which parsed as nothing and was
+# reported as "empty, the safer state" on every one of them.
+REST_INDEX_MAX_BYTES = 8_000_000
 
 # [OPTIONAL] Limits.
 EVIDENCE_ROWS = 12           # evidence rows shown per finding in the report
@@ -256,10 +285,12 @@ PROBE_PATHS: List[Tuple[str, str, str]] = [
     ("/wp-config.txt", "CRITICAL", "the WordPress configuration file as plain text"),
     ("/.env", "CRITICAL", "an environment file, which usually holds API keys and database credentials"),
     ("/.git/config", "CRITICAL", "a Git repository, from which the whole source tree can be reconstructed"),
+    ("/.git/HEAD", "CRITICAL", "a Git repository, from which the whole source tree can be reconstructed"),
     ("/.svn/entries", "HIGH", "a Subversion working copy"),
     ("/.htpasswd", "CRITICAL", "an HTTP authentication password file"),
     ("/.aws/credentials", "CRITICAL", "Amazon Web Services credentials"),
     ("/id_rsa", "CRITICAL", "a private SSH key"),
+    ("/.user.ini", "MEDIUM", "a per-directory PHP configuration file, which names paths and settings"),
     # Logs and diagnostics.
     ("/wp-content/debug.log", "HIGH", "the WordPress debug log, which leaks file paths and sometimes credentials"),
     ("/error_log", "MEDIUM", "the server error log"),
@@ -267,11 +298,28 @@ PROBE_PATHS: List[Tuple[str, str, str]] = [
     ("/info.php", "HIGH", "a phpinfo() page"),
     ("/adminer.php", "CRITICAL", "Adminer, a web database client"),
     ("/phpmyadmin/", "HIGH", "phpMyAdmin, a web database client"),
+    ("/server-status", "MEDIUM", "the Apache status page, which lists live requests and visitor addresses"),
+    # Developer artefacts. Not a way in, but they name every library and its
+    # version, which is the shortlist of exploits worth trying.
+    ("/composer.json", "LOW", "the Composer manifest, which lists the PHP packages installed and their versions"),
+    ("/package.json", "LOW", "the Node manifest, which lists the JavaScript packages used to build the site"),
+    ("/.DS_Store", "LOW", "a macOS folder index, which lists the names of every file in the directory including ones nothing links to"),
     # Directory listings.
     ("/wp-content/uploads/", "MEDIUM", "a browsable list of every uploaded file"),
     ("/wp-content/plugins/", "MEDIUM", "a browsable list of every installed plugin"),
     ("/wp-content/themes/", "LOW", "a browsable list of every installed theme"),
     ("/wp-includes/", "LOW", "a browsable WordPress core directory"),
+    ("/vendor/", "LOW", "a browsable Composer vendor directory"),
+    ("/node_modules/", "LOW", "a browsable Node modules directory"),
+    # Form and commerce upload directories. This is where client personal
+    # information actually leaks: attachments visitors uploaded through a
+    # form, order logs, file-manager backups. Only a browsable listing
+    # counts; the directory existing is normal on any site with the plugin.
+    ("/wp-content/uploads/wpforms/", "HIGH", "a browsable list of files visitors uploaded through WPForms"),
+    ("/wp-content/uploads/formidable/", "HIGH", "a browsable list of files visitors uploaded through Formidable Forms"),
+    ("/wp-content/uploads/gravity_forms/", "HIGH", "a browsable list of files visitors uploaded through Gravity Forms"),
+    ("/wp-content/uploads/wc-logs/", "HIGH", "WooCommerce log files, which contain order and customer details"),
+    ("/wp-content/uploads/wp-file-manager-pro/fm_backup/", "CRITICAL", "File Manager backups, which contain the whole site"),
     # Version and platform disclosure.
     ("/readme.html", "LOW", "the WordPress readme, which confirms the platform and the PHP floor"),
     ("/license.txt", "LOW", "the WordPress licence file, which confirms the platform and often narrows the version"),
@@ -286,6 +334,49 @@ PROBE_PATHS: List[Tuple[str, str, str]] = [
 # Paths where a 200 is normal and only the CONTENT decides whether it is a
 # finding. Checked by name in path_is_exposed().
 INSTALLER_PATHS = ("/wp-admin/install.php", "/wp-admin/setup-config.php")
+
+# What a live installer page actually contains. The finding needs one of these
+# present, not merely "Already Installed" absent: a WAF that answers wp-admin
+# requests with a 200 challenge page contains neither, and reading that as an
+# open installer would put a false HIGH in front of a client.
+INSTALLER_MARKERS = ("weblog_title", "language-chooser", "information needed",
+                     "welcome to wordpress", "setup-config", "site title",
+                     "create a configuration file", "wp-config.php")
+
+# Content a real file at this path must contain, matched case-insensitively
+# anywhere in the body. A 200 whose body has none of them is recorded as
+# "answered, unexpected content" rather than as readable: a themed not-found
+# page or a WAF block page served with a 200 has no business in a CRITICAL
+# table. Archives are checked by their first bytes in content_matches().
+# Paths not listed here keep the plain 200 rule.
+CONTENT_MARKERS: Dict[str, Tuple[str, ...]] = {
+    "/.env": ("=",),
+    "/.git/config": ("[core]", "repositoryformatversion"),
+    "/.git/HEAD": ("ref:", "refs/"),
+    "/.htpasswd": (":",),
+    "/.aws/credentials": ("aws_access_key_id", "aws_secret_access_key"),
+    "/id_rsa": ("private key",),
+    "/.user.ini": ("=",),
+    "/wp-config.php.bak": ("db_name", "db_password", "<?php"),
+    "/wp-config.php~": ("db_name", "db_password", "<?php"),
+    "/wp-config.php.save": ("db_name", "db_password", "<?php"),
+    "/wp-config.txt": ("db_name", "db_password", "<?php"),
+    "/wp-content/debug.log": ("php ", "[", "warning", "notice", "error"),
+    "/error_log": ("php ", "[", "warning", "notice", "error"),
+    "/phpinfo.php": ("phpinfo()", "php version"),
+    "/info.php": ("phpinfo()", "php version"),
+    "/adminer.php": ("adminer",),
+    "/phpmyadmin/": ("phpmyadmin",),
+    "/server-status": ("server status", "server version"),
+    "/composer.json": ('"require"', '"name"'),
+    "/package.json": ('"name"', '"dependencies"'),
+    "/.DS_Store": ("bud1",),
+    "/installer.php": ("duplicator",),
+    "/installer-backup.php": ("duplicator",),
+    "/dup-installer/": ("index of /", "duplicator"),
+}
+SQL_MARKERS = ("insert into", "create table", "-- mysql dump", "-- phpmyadmin",
+               "drop table", "/*!40101")
 
 # Security response headers, with what their absence costs. Severity is the
 # author's rating; see "Severity" in the README for how these were set.
@@ -341,36 +432,95 @@ DOC_EXT = {".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
 CORE_NAMESPACES = {"oembed/1.0", "wp/v2", "wp-site-health/v1",
                    "wp-block-editor/v1", "wp/v2/", "wp-abilities/v1"}
 
-# Namespace prefix -> human name, so the report reads as a plugin inventory
-# rather than a list of slugs. Unknown namespaces are shown as-is.
-NAMESPACE_NAMES = {
-    "akismet/v1": "Akismet",
-    "carbon-fields/v1": "Carbon Fields",
-    "code-snippets/v1": "Code Snippets",
-    "complianz/v1": "Complianz",
-    "contact-form-7/v1": "Contact Form 7",
-    "elementor/v1": "Elementor",
-    "fluent-smtp": "FluentSMTP",
-    "gf/v2": "Gravity Forms",
-    "google-site-kit/v1": "Site Kit by Google",
-    "health-check/v1": "Health Check",
-    "hostinger-ai-assistant/v1": "Hostinger AI Assistant",
-    "hostinger-tools-plugin/v1": "Hostinger Tools",
-    "jetpack/v4": "Jetpack",
-    "litespeed/v1": "LiteSpeed Cache",
-    "litespeed/v3": "LiteSpeed Cache",
-    "mainwp/v1": "MainWP Dashboard",
-    "mainwp/v2": "MainWP Dashboard",
-    "mcp": "MCP adapter",
-    "redirection/v1": "Redirection",
-    "sg-security/v1": "SiteGround Security",
-    "siteground-settings/v1": "SiteGround Optimizer",
-    "squirrly/v1": "Squirrly SEO",
-    "wc/v3": "WooCommerce",
-    "wordfence/v1": "Wordfence",
-    "wp-rocket/v1": "WP Rocket",
-    "yoast/v1": "Yoast SEO",
+# Namespace prefix -> (human name, plugin directory slug), so the report reads
+# as a plugin inventory rather than a list of slugs, and so a plugin known only
+# from its namespace can have its readme.txt read for a version. The slug is
+# None where the directory name is not known with confidence; guessing one
+# would be probing for plugins the site never advertised, which this tool does
+# not do. Unknown namespaces are shown as-is.
+NAMESPACE_PLUGINS: Dict[str, Tuple[str, Optional[str]]] = {
+    "acf/v3": ("Advanced Custom Fields", "advanced-custom-fields"),
+    "aioseo/v1": ("All in One SEO", "all-in-one-seo-pack"),
+    "akismet/v1": ("Akismet", "akismet"),
+    "apple-news/v1": ("Publish to Apple News", "publish-to-apple-news"),
+    "bctt/v1": ("Better Click To Tweet", "better-click-to-tweet"),
+    "buddypress/v1": ("BuddyPress", "buddypress"),
+    "carbon-fields/v1": ("Carbon Fields", "carbon-fields"),
+    "coauthors/v1": ("Co-Authors Plus", "co-authors-plus"),
+    "code-snippets/v1": ("Code Snippets", "code-snippets"),
+    "complianz/v1": ("Complianz", "complianz-gdpr"),
+    "contact-form-7/v1": ("Contact Form 7", "contact-form-7"),
+    "duplicator/v1": ("Duplicator", "duplicator"),
+    "elasticpress/v1": ("ElasticPress", "elasticpress"),
+    "elementor/v1": ("Elementor", "elementor"),
+    "fluent-smtp": ("FluentSMTP", "fluent-smtp"),
+    "gf/v2": ("Gravity Forms", "gravityforms"),
+    "google-site-kit/v1": ("Site Kit by Google", "google-site-kit"),
+    "health-check/v1": ("Health Check", "health-check"),
+    "hostinger-ai-assistant/v1": ("Hostinger AI Assistant", None),
+    "hostinger-tools-plugin/v1": ("Hostinger Tools", None),
+    "ithemes-security/v1": ("Solid Security", "better-wp-security"),
+    "jetpack/v4": ("Jetpack", "jetpack"),
+    "jetpack-boost/v1": ("Jetpack Boost", "jetpack-boost"),
+    "kadence-blocks/v1": ("Kadence Blocks", "kadence-blocks"),
+    "litespeed/v1": ("LiteSpeed Cache", "litespeed-cache"),
+    "litespeed/v3": ("LiteSpeed Cache", "litespeed-cache"),
+    "mainwp/v1": ("MainWP Dashboard", "mainwp"),
+    "mainwp/v2": ("MainWP Dashboard", "mainwp"),
+    "mcp": ("MCP adapter", None),
+    "monsterinsights/v1": ("MonsterInsights", "google-analytics-for-wordpress"),
+    "rankmath/v1": ("Rank Math SEO", "seo-by-rank-math"),
+    "redirection/v1": ("Redirection", "redirection"),
+    "regenerate-thumbnails/v1": ("Regenerate Thumbnails", "regenerate-thumbnails"),
+    "seopress/v1": ("SEOPress", "wp-seopress"),
+    "sg-security/v1": ("SiteGround Security", "sg-security"),
+    "simple-page-ordering/v1": ("Simple Page Ordering", "simple-page-ordering"),
+    "siteground-settings/v1": ("SiteGround Optimizer", "sg-cachepress"),
+    "squirrly/v1": ("Squirrly SEO", "squirrly-seo"),
+    "tribe/events/v1": ("The Events Calendar", "the-events-calendar"),
+    "two-factor/1.0": ("Two-Factor", "two-factor"),
+    "wc/v3": ("WooCommerce", "woocommerce"),
+    "wordfence/v1": ("Wordfence", "wordfence"),
+    "wp-mail-smtp/v1": ("WP Mail SMTP", "wp-mail-smtp"),
+    "wp-parsely/v2": ("Parse.ly", "wp-parsely"),
+    "wp-rocket/v1": ("WP Rocket", "wp-rocket"),
+    "wpforms/v1": ("WPForms", "wpforms-lite"),
+    "yoast/v1": ("Yoast SEO", "wordpress-seo"),
 }
+NAMESPACE_NAMES = {ns: name for ns, (name, _) in NAMESPACE_PLUGINS.items()}
+
+# Response headers that identify a CDN, WAF or managed host in front of the
+# site. What sits in front changes what every probe means: a 403 may be the
+# edge rather than the file, and a version read through a cache may be stale.
+# Each entry is (label, header, substring-or-None). None means presence alone.
+EDGE_SIGNS: List[Tuple[str, str, Optional[str]]] = [
+    ("Cloudflare", "cf-ray", None),
+    ("Cloudflare", "server", "cloudflare"),
+    ("Sucuri", "x-sucuri-id", None),
+    ("Sucuri", "x-sucuri-cache", None),
+    ("Akamai", "server", "akamai"),
+    ("Akamai", "x-akamai-transformed", None),
+    ("CloudFront", "via", "cloudfront"),
+    ("CloudFront", "server", "cloudfront"),
+    ("Fastly", "via", "varnish"),
+    ("Fastly", "x-served-by", "cache-"),
+    ("Kinsta", "x-kinsta-cache", None),
+    ("WP Engine", "x-powered-by", "wp engine"),
+    ("Hostinger", "server", "hcdn"),
+    ("LiteSpeed", "server", "litespeed"),
+    ("LiteSpeed", "x-litespeed-cache", None),
+    ("Nginx", "server", "nginx"),
+    ("Apache", "server", "apache"),
+]
+
+# Body text that means the response is a WAF block or bot challenge, not the
+# page asked for. Checked on the homepage; if the homepage itself is one of
+# these, every later module is reading the edge and not the site.
+CHALLENGE_MARKERS = ("just a moment", "cf-chl", "challenge-platform",
+                     "attention required", "sucuri website firewall",
+                     "generated by wordfence", "access denied",
+                     "your access to this site has been limited",
+                     "enable javascript and cookies to continue")
 
 # Namespaces that accept a write method anonymously and deserve their own
 # finding rather than a line in the inventory.
@@ -578,29 +728,86 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
-def fetch(url: str, method: str = "GET",
-          timeout: int = REQUEST_TIMEOUT) -> Tuple[int, Dict[str, str], str]:
+def _headers(msg) -> Dict[str, str]:
+    """Lowercased header dict that keeps every Set-Cookie.
+
+    A dict comprehension over headers.items() keeps only the LAST Set-Cookie
+    when a response sets several, so a cookie without Secure that was set
+    first vanished from the cookie check. Multiple cookies are joined with a
+    newline, which cannot appear inside a header value; the caller splits on
+    it. Splitting on commas is wrong because Expires carries one.
+    """
+    out = {k.lower(): v for k, v in msg.items()}
+    try:
+        cookies = msg.get_all("Set-Cookie") or []
+    except AttributeError:
+        cookies = []
+    if len(cookies) > 1:
+        out["set-cookie"] = "\n".join(cookies)
+    return out
+
+
+def fetch(url: str, method: str = "GET", timeout: int = REQUEST_TIMEOUT,
+          max_bytes: int = MAX_BODY_BYTES) -> Tuple[int, Dict[str, str], str]:
     """One request with a browser UA, redirects followed.
 
     Returns (status, lowercased headers, body text). Status 0 means the
     request never completed, and headers carries "_error" with the reason.
+    A body cut off at max_bytes sets "_truncated", so a caller parsing JSON
+    can tell a truncated document from a non-JSON one.
     """
-    time.sleep(REQUEST_DELAY)
+    time.sleep(_delay())
     req = urllib.request.Request(url, method=method,
                                  headers={"User-Agent": USER_AGENT})
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            body = r.read(MAX_BODY_BYTES) if method == "GET" else b""
-            return (r.status, {k.lower(): v for k, v in r.headers.items()},
-                    body.decode("utf-8", "replace"))
-    except urllib.error.HTTPError as e:
+    for attempt in (1, 2):
         try:
-            body = e.read(MAX_BODY_BYTES).decode("utf-8", "replace")
-        except Exception:
-            body = ""
-        return e.code, {k.lower(): v for k, v in (e.headers or {}).items()}, body
-    except Exception as e:
-        return 0, {"_error": f"{type(e).__name__}: {e}"}, ""
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                body = r.read(max_bytes) if method == "GET" else b""
+                hdrs = _headers(r.headers)
+                if len(body) >= max_bytes:
+                    hdrs["_truncated"] = str(max_bytes)
+                return r.status, hdrs, body.decode("utf-8", "replace")
+        except urllib.error.HTTPError as e:
+            if e.code == 429 and attempt == 1 and _back_off(e.headers):
+                continue
+            try:
+                body = e.read(max_bytes).decode("utf-8", "replace")
+            except Exception:
+                body = ""
+            return e.code, _headers(e.headers or {}), body
+        except Exception as e:
+            return 0, {"_error": f"{type(e).__name__}: {e}"}, ""
+    return 0, {"_error": "unreachable"}, ""
+
+
+# Rate limiting. One live run got HTTP 429 on 21 probes and both REST index
+# requests after the path sweep ran at seven requests a second through
+# Cloudflare. A 429 is a request to slow down, so the tool does: it waits
+# (Retry-After when given, otherwise a few seconds), retries once, and slows
+# every later request for the rest of the run. Anything still refused is
+# recorded as "rate limited", never as "not readable".
+RATE_LIMIT_PAUSE = 8          # seconds to wait after a 429 with no Retry-After
+RATE_LIMIT_MAX_PAUSE = 30
+_slowdown = 1.0
+
+
+def _delay() -> float:
+    return REQUEST_DELAY * _slowdown
+
+
+def _back_off(headers) -> bool:
+    """Wait as the server asked, and slow the rest of the run. Always True."""
+    global _slowdown
+    try:
+        pause = float((headers or {}).get("Retry-After", RATE_LIMIT_PAUSE))
+    except (TypeError, ValueError):
+        pause = RATE_LIMIT_PAUSE
+    pause = min(max(pause, 1.0), RATE_LIMIT_MAX_PAUSE)
+    _slowdown = min(_slowdown * 2, 16.0)
+    print_warning(f"HTTP 429: pausing {pause:.0f}s and slowing the run "
+                  f"({_delay():.2f}s between requests)")
+    time.sleep(pause)
+    return True
 
 
 def fetch_no_redirect(url: str,
@@ -612,31 +819,51 @@ def fetch_no_redirect(url: str,
     Location header, which reads as "this site does not redirect" when it
     does; and ?author=N looks blocked because you never see where it pointed.
     """
-    time.sleep(REQUEST_DELAY)
+    time.sleep(_delay())
     opener = urllib.request.build_opener(_NoRedirect)
     req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-    try:
-        with opener.open(req, timeout=timeout) as r:
-            return r.status, {k.lower(): v for k, v in r.headers.items()}
-    except urllib.error.HTTPError as e:
-        return e.code, {k.lower(): v for k, v in (e.headers or {}).items()}
-    except Exception as e:
-        return 0, {"_error": f"{type(e).__name__}: {e}"}
+    for attempt in (1, 2):
+        try:
+            with opener.open(req, timeout=timeout) as r:
+                return r.status, _headers(r.headers)
+        except urllib.error.HTTPError as e:
+            if e.code == 429 and attempt == 1 and _back_off(e.headers):
+                continue
+            return e.code, _headers(e.headers or {})
+        except Exception as e:
+            return 0, {"_error": f"{type(e).__name__}: {e}"}
+    return 0, {"_error": "unreachable"}
 
 
-def fetch_json(url: str):
+def fetch_json(url: str, max_bytes: int = MAX_BODY_BYTES):
     """GET a URL and parse JSON. Returns (status, headers, object-or-None).
 
     A host serving a challenge page returns valid HTTP and invalid JSON, so
-    the caller needs to tell "no data" from "not JSON".
+    the caller needs to tell "no data" from "not JSON". A truncated body is a
+    third case and the most misleading: it is valid JSON that was cut off,
+    and headers["_truncated"] is how the caller finds out.
     """
-    status, hdrs, body = fetch(url)
+    status, hdrs, body = fetch(url, max_bytes=max_bytes)
     if status != 200:
         return status, hdrs, None
     try:
         return status, hdrs, json.loads(body)
     except json.JSONDecodeError:
         return status, hdrs, None
+
+
+def edge_identity(hdrs: Dict[str, str], body: str = "") -> Dict:
+    """Name what is in front of the site, and whether this response is a
+    block or challenge page rather than the page asked for."""
+    seen: List[str] = []
+    for label, header, needle in EDGE_SIGNS:
+        value = hdrs.get(header, "")
+        if header in hdrs and (needle is None or needle in value.lower()):
+            if label not in seen:
+                seen.append(label)
+    low = body.lower()[:20000]
+    challenged = any(marker in low for marker in CHALLENGE_MARKERS)
+    return {"edge": seen, "challenged": challenged}
 
 
 ###############################################################################
@@ -726,11 +953,23 @@ def vuln_applies(version: str, operator: Dict) -> Optional[bool]:
 
 
 def cvss_severity(score: float) -> str:
-    """Report severity for a CVSS base score."""
+    """Report severity for a CVSS base score.
+
+    A record with no score is unknown, not low. It comes back as MEDIUM so
+    the badge and the copy ("read unscored as unknown") say the same thing.
+    """
+    if not score or score <= 0:
+        return "MEDIUM"
     for floor, severity in CVSS_BANDS:
         if score >= floor:
             return severity
     return "LOW"
+
+
+def cap_severity(severity: str, ceiling: str) -> str:
+    """The lower of two severities. A cap must never raise a finding."""
+    return (ceiling if SEVERITY_ORDER.index(severity) < SEVERITY_ORDER.index(ceiling)
+            else severity)
 
 
 def _vuln_rows(record: Dict, version: str) -> Tuple[List[Dict], int]:
@@ -928,6 +1167,10 @@ def calibrate_missing(site: str) -> Dict:
     return signature
 
 
+CONTROL_PATHS = ("/robots.txt", "/wp-includes/js/jquery/jquery.min.js",
+                 "/wp-login.php")
+
+
 def verify_calibration(site: str, missing: Dict) -> Dict:
     """Positive control: a path that DOES exist must not match the 404 shape.
 
@@ -941,21 +1184,61 @@ def verify_calibration(site: str, missing: Dict) -> Dict:
     redirects to HTTPS: there, every real file 301s exactly like a missing
     one, robots.txt is classified absent, and the whole report would
     otherwise come back empty with exit code 0.
+
+    A site with no robots.txt cannot prove anything with it, so two more
+    files that exist on every WordPress install are tried before the control
+    is recorded as not run. "Not run" is its own state: an earlier version
+    recorded a 404 on robots.txt as trustworthy and said nothing, which is
+    a control that silently did not happen.
     """
-    status, _, body = fetch(f"{site}/robots.txt")
-    no_redirect_status, _ = fetch_no_redirect(f"{site}/robots.txt")
-    exposed = path_is_exposed("/robots.txt", status, body, missing,
-                              no_redirect_status)
-    return {
-        "control_path": "/robots.txt",
-        "status": status,
-        "no_redirect_status": no_redirect_status,
-        "classified_present": bool(exposed),
-        "trustworthy": bool(exposed) or status not in (200,),
-        "note": ("A file known to exist was classified as absent, so the "
-                 "calibration is hiding real findings."
-                 if status == 200 and not exposed else ""),
-    }
+    result = {"control_path": "", "status": 0, "no_redirect_status": 0,
+              "classified_present": False, "trustworthy": True,
+              "ran": False, "note": "", "robots_disallow": []}
+    for path in CONTROL_PATHS:
+        status, _, body = fetch(f"{site}{path}")
+        no_redirect_status, _ = fetch_no_redirect(f"{site}{path}")
+        if path == "/robots.txt" and status == 200:
+            result["robots_disallow"] = re.findall(
+                r"(?im)^disallow:\s*(\S+)", body)[:40]
+        if status != 200:
+            continue
+        exposed = path_is_exposed(path, status, body, missing,
+                                  no_redirect_status)
+        result.update({
+            "control_path": path, "status": status, "ran": True,
+            "no_redirect_status": no_redirect_status,
+            "classified_present": bool(exposed),
+            "trustworthy": bool(exposed),
+            "note": ("" if exposed else
+                     f"A file known to exist ({path}) was classified as "
+                     "absent, so the calibration is hiding real findings."),
+        })
+        return result
+    result["note"] = ("No control file answered (robots.txt, core jQuery, "
+                      "wp-login.php), so the calibration could not be proved "
+                      "to let real files through. Path findings are reported "
+                      "but unproven.")
+    return result
+
+
+def content_matches(path: str, body: str) -> Optional[bool]:
+    """Does the body look like the file this path claims to be?
+
+    Returns None when no rule exists for the path, True when the expected
+    content is there, False when a 200 came back with something else. The
+    empty body is the caller's decision, not this function's.
+    """
+    low = body.lower()
+    if path.endswith(".zip"):
+        return body.startswith("PK")
+    if path.endswith(".gz") or path.endswith(".tgz"):
+        return body.startswith("\x1f")
+    if path.endswith(".sql"):
+        return any(m in low for m in SQL_MARKERS)
+    markers = CONTENT_MARKERS.get(path)
+    if markers is None:
+        return None
+    return any(m in low for m in markers)
 
 
 def path_is_exposed(path: str, status: int, body: str,
@@ -981,10 +1264,13 @@ def path_is_exposed(path: str, status: int, body: str,
 
     # The installer and setup wizard answer on every WordPress site. They are
     # only a finding if they still offer to install; "Already Installed" is
-    # the safe response and reporting it sends a client a false positive.
+    # the safe response and reporting it sends a client a false positive. So
+    # is a WAF page served with a 200, which is why a positive marker of the
+    # install form is required rather than the mere absence of the refusal.
     if path in INSTALLER_PATHS:
-        return ("already installed" not in low
-                and "already configured" not in low)
+        if "already installed" in low or "already configured" in low:
+            return False
+        return any(m in low for m in INSTALLER_MARKERS)
 
     # Same fingerprint as a path that cannot exist means this is the site's
     # 404 template, whatever status it carried.
@@ -1005,8 +1291,76 @@ def path_is_exposed(path: str, status: int, body: str,
         return "index of /" in low
 
     # An empty 200 on a file path is a real, empty file. Reporting it costs
-    # one INFO line; not reporting it hides a truncated dump.
+    # one INFO line; not reporting it hides a truncated dump. check_paths()
+    # keeps empties out of the severity bands for the same reason.
+    if not body.strip():
+        return True
+
+    # Where the file has a known shape, the body has to have it. A 200 with
+    # the wrong content is a block page or a soft 404 the fingerprint missed.
+    verdict = content_matches(path, body)
+    if verdict is False:
+        return False
     return True
+
+
+def path_verdict(path: str, status: int, body: str, exposed: bool,
+                 no_redirect_status: Optional[int] = None) -> str:
+    """A few words for the appendix: what happened to this probe.
+
+    "not readable" used to cover a timeout as well, which read as "checked
+    and clean" for a path that was never checked at all.
+    """
+    if status == 0:
+        return "no answer"
+    if status == 429:
+        return "rate limited"
+    if exposed:
+        return "readable" if body.strip() else "empty"
+    if no_redirect_status and 300 <= no_redirect_status < 400:
+        return "redirected (not a file)"
+    if (status == 200 and body.strip() and not path.endswith("/")
+            and content_matches(path, body) is False):
+        return "answered, unexpected content"
+    return "not readable"
+
+
+def _readme_stable_tag(site: str, slug: str) -> str:
+    """The Stable tag from a plugin's own readme.txt, or "".
+
+    Independent of the page cache and of asset URLs, so it cross-checks the
+    version read from ?ver= and supplies one where no asset carried it. It is
+    a second witness, not the authority: authors forget to bump it, and
+    "trunk" is a legal value. Both are rejected here.
+    """
+    status, _, body = fetch(f"{site}/wp-content/plugins/{slug}/readme.txt",
+                            max_bytes=65_536)
+    if status != 200 or "<html" in body[:2000].lower():
+        return ""
+    match = re.search(r"(?im)^\s*stable tag:\s*([0-9][0-9a-zA-Z.\-]*)\s*$", body)
+    return match.group(1).strip() if match else ""
+
+
+def _theme_style(site: str, slug: str) -> Dict:
+    """Version, name and parent theme from a theme's style.css header.
+
+    The homepage names the theme directory but never its version, so without
+    this no theme vulnerability can ever be matched.
+    """
+    status, _, body = fetch(f"{site}/wp-content/themes/{slug}/style.css",
+                            max_bytes=65_536)
+    out = {"status": status, "version": "", "name": "", "parent": ""}
+    if status != 200 or "<html" in body[:2000].lower():
+        return out
+    head = body[:8000]
+    for key, field in (("version", r"Version"), ("name", r"Theme Name"),
+                       ("parent", r"Template")):
+        match = re.search(rf"(?im)^\s*\*?\s*{field}:\s*(.+?)\s*$", head)
+        if match:
+            out[key] = match.group(1).strip()
+    if not re.match(r"^\d", out["version"]):
+        out["version"] = ""
+    return out
 
 
 def calibration_is_ambiguous(missing: Optional[Dict]) -> bool:
@@ -1096,6 +1450,22 @@ class RunContext:
         data = self.data("calibration")
         return data.get("signature") if data else None
 
+    def rest_url(self, route: str) -> str:
+        """A REST route as this site serves it.
+
+        /wp-json/ needs pretty permalinks. Without them WordPress still
+        answers on /?rest_route=/, and a tool that only knows the first form
+        reports an empty REST surface on exactly the sites least likely to
+        have been hardened. collect_rest() records which form works.
+        """
+        base = self.manifest["meta"].get("rest_base", "/wp-json")
+        route = route if route.startswith("/") else "/" + route
+        if base == "/wp-json":
+            return self.site + "/wp-json" + route
+        path, _, query = route.partition("?")
+        return (self.site + "/?rest_route=" + urllib.parse.quote(path, safe="/")
+                + (f"&{query}" if query else ""))
+
 
 ###############################################################################
 # COLLECT
@@ -1110,6 +1480,8 @@ def collect_calibration(ctx: RunContext) -> Tuple[str, int, str]:
     ctx.write("calibration", {"signature": signature, "control": control})
     if not control["trustworthy"]:
         return "error", 0, control["note"]
+    if not control.get("ran"):
+        return "partial", 1, control["note"]
     if calibration_is_ambiguous(signature):
         return ("partial", 1,
                 "the site answers missing paths with a 200 whose content "
@@ -1121,17 +1493,71 @@ def collect_calibration(ctx: RunContext) -> Tuple[str, int, str]:
     return "ok", 1, ""
 
 
+def _site_named_backups(site: str) -> List[Tuple[str, str, str]]:
+    """Backup filenames derived from the site's own name.
+
+    example.com.zip and example.sql are the commonest real backup names and
+    cannot come from a static list. Content is checked by content_matches(),
+    so a soft 404 cannot satisfy these.
+    """
+    host = urllib.parse.urlparse(site).netloc.lower().split(":")[0]
+    bare = host[4:] if host.startswith("www.") else host
+    stem = bare.split(".")[0]
+    names = []
+    for base in dict.fromkeys([bare, stem]):
+        names.append((f"/{base}.zip", "CRITICAL",
+                      "a site backup archive named after the site"))
+        names.append((f"/{base}.sql", "CRITICAL",
+                      "a database dump named after the site"))
+    names.append(("/wp-content.zip", "CRITICAL",
+                  "an archive of wp-content, which holds every upload and plugin"))
+    names.append(("/latest.sql", "CRITICAL", "a database dump"))
+    return names
+
+
+def _robots_probe_rows(disallow: List[str]) -> List[Tuple[str, str, str]]:
+    """robots.txt Disallow entries worth requesting.
+
+    The owner's own list of paths they did not want indexed, and public.
+    Attackers read it as a shortlist. Wildcards, the default /wp-admin/ line
+    and core directories are skipped; the rest are probed at INFO severity
+    with copy that says what they are.
+    """
+    out = []
+    for raw in disallow:
+        path = raw.strip()
+        if (not path.startswith("/") or any(c in path for c in "*$?")
+                or path in ("/", "/wp-admin/", "/wp-admin")
+                or path.startswith(("/wp-admin", "/wp-includes", "/wp-login"))
+                or len(path) > 120):
+            continue
+        out.append((path, "INFO",
+                    "listed as Disallow in robots.txt, so the site owner did "
+                    "not want it indexed"))
+        if len(out) >= 20:
+            break
+    return out
+
+
 def collect_paths(ctx: RunContext) -> Tuple[str, int, str]:
     """Request every path in PROBE_PATHS, redirect-aware and calibrated."""
     missing = ctx.missing_signature
+    calibration = ctx.data("calibration") or {}
+    disallow = (calibration.get("control") or {}).get("robots_disallow", [])
+    probed = {p for p, _, _ in PROBE_PATHS}
+    extra = [t for t in _site_named_backups(ctx.site) if t[0] not in probed]
+    probed |= {p for p, _, _ in extra}
+    extra += [t for t in _robots_probe_rows(disallow) if t[0] not in probed]
     rows = []
-    for path, severity, why in PROBE_PATHS:
+    for path, severity, why in PROBE_PATHS + extra:
         if shutdown_requested:
             ctx.write("paths", rows)
             return "partial", len(rows), "stopped by the operator"
         url = ctx.site + path
         no_redirect_status, _ = fetch_no_redirect(url)
         status, hdrs, body = fetch(url)
+        exposed = path_is_exposed(path, status, body, missing,
+                                  no_redirect_status)
         rows.append({
             "path": path,
             "url": url,
@@ -1141,11 +1567,21 @@ def collect_paths(ctx: RunContext) -> Tuple[str, int, str]:
             "no_redirect_status": no_redirect_status,
             "bytes": len(body),
             "content_type": hdrs.get("content-type", ""),
-            "exposed": path_is_exposed(path, status, body, missing,
-                                       no_redirect_status),
+            "exposed": exposed,
+            "verdict": path_verdict(path, status, body, exposed,
+                                    no_redirect_status),
             "error": hdrs.get("_error", ""),
         })
     ctx.write("paths", rows)
+    unanswered = [r for r in rows if r["verdict"] in ("no answer", "rate limited")]
+    if unanswered:
+        # A probe that never got an answer was not checked. Saying "ok" here
+        # would let the appendix read those rows as clean.
+        return ("partial", len(rows),
+                f"{len(unanswered)} path(s) got no answer or were rate "
+                "limited, so they were not checked: "
+                + ", ".join(r["path"] for r in unanswered[:8])
+                + ("..." if len(unanswered) > 8 else ""))
     return "ok", len(rows), ""
 
 
@@ -1155,9 +1591,11 @@ def collect_headers(ctx: RunContext) -> Tuple[str, int, str]:
     if status == 0:
         ctx.write("headers", {})
         return "error", 0, hdrs.get("_error", "homepage unreachable")
+    edge = edge_identity(hdrs, body)
     cookies = []
-    raw = hdrs.get("set-cookie", "")
-    for chunk in raw.split(","):
+    # Multiple cookies arrive newline-joined from _headers(). Each one is
+    # then "name=value; attr; attr".
+    for chunk in hdrs.get("set-cookie", "").split("\n"):
         if "=" not in chunk:
             continue
         low = chunk.lower()
@@ -1167,21 +1605,115 @@ def collect_headers(ctx: RunContext) -> Tuple[str, int, str]:
             "httponly": "httponly" in low,
             "samesite": "samesite" in low,
         })
+    generators = re.findall(r'<meta name="generator" content="([^"]+)"', body)
+
+    # Core version, from every free source, because the generator tag is the
+    # first thing a hardening guide removes and the homepage may be a cached
+    # copy built before the last update. Sources are kept apart so a
+    # disagreement is visible rather than averaged away.
+    core_versions: Dict[str, str] = {}
+    for g in generators:
+        if g.lower().startswith("wordpress"):
+            core_versions["generator"] = re.sub(r"^wordpress\s*", "", g,
+                                                flags=re.I).strip()
+    # Only the core files that are enqueued with $wp_version. jQuery and the
+    # other bundled libraries carry their own numbers, and the first version
+    # of this read "3.4.1" off jquery-migrate and reported it as a second
+    # opinion on the core version.
+    includes = re.findall(
+        r"/wp-includes/(?:js/wp-emoji-release\.min\.js|js/wp-embed\.min\.js"
+        r"|css/dist/block-library/style\.min\.css|css/classic-themes\.min\.css"
+        r")\?ver=(\d[\d.]*\d)", body)
+    if includes:
+        core_versions["wp-includes assets"] = max(
+            set(includes), key=includes.count)
+    if status == 200 and not edge["challenged"]:
+        # Same page, cache-busted, generator only. If this disagrees with the
+        # first reading the cached copy is stale and the report says so.
+        _, _, fresh = fetch(f"{ctx.site}/?nc={uuid.uuid4().hex[:8]}")
+        for g in re.findall(r'<meta name="generator" content="([^"]+)"', fresh):
+            if g.lower().startswith("wordpress"):
+                core_versions["generator (cache-busted)"] = re.sub(
+                    r"^wordpress\s*", "", g, flags=re.I).strip()
+        f_status, _, feed = fetch(ctx.site + "/feed/")
+        if f_status == 200:
+            match = re.search(r"<generator>[^<]*\?v=([^<\s]+)</generator>", feed)
+            if match:
+                core_versions["feed"] = match.group(1).strip()
+
+    themes = sorted(set(re.findall(r"/wp-content/themes/([^/\"']+)/", body)))
+    theme_info = {}
+    for slug in themes:
+        if shutdown_requested:
+            break
+        theme_info[slug] = _theme_style(ctx.site, slug)
+
+    # Is this WordPress at all? Without this the WordPress modules on a
+    # non-WordPress site all came back "empty, the safer state", which reads
+    # as a hardened install. The platform-neutral checks (headers, TLS,
+    # cookies, mail DNS, generic paths) still apply to any site.
+    signals = []
+    if "/wp-content/" in body:
+        signals.append("wp-content paths")
+    if "/wp-includes/" in body:
+        signals.append("wp-includes paths")
+    if any(g.lower().startswith("wordpress") for g in generators):
+        signals.append("generator tag")
+    if "api.w.org" in hdrs.get("link", "") or "api.w.org" in body:
+        signals.append("REST discovery link")
+    if not signals and status == 200 and not edge["challenged"]:
+        # A headless front end shows none of the above. wp-login.php is the
+        # one WordPress URL that survives a decoupled theme.
+        l_status, _, login = fetch(ctx.site + "/wp-login.php", max_bytes=65_536)
+        if l_status == 200 and "wp-login" in login.lower() and "log in" in login.lower():
+            signals.append("wp-login.php")
+    ctx.manifest["meta"]["platform"] = {
+        "wordpress": bool(signals), "signals": signals,
+        "decided": status == 200 and not edge["challenged"]}
+    ctx.save()
+
+    # Resources loaded over plain HTTP from an HTTPS page. Browsers block the
+    # active ones outright and mark the page "not secure" for the rest.
+    mixed = []
+    if ctx.site.startswith("https://"):
+        for tag, attr in re.findall(
+                r"<(script|img|iframe|source|video|audio|link)\b[^>]*?\b(?:src|href)"
+                r"=[\"'](http://[^\"']+)", body, flags=re.I):
+            mixed.append({"tag": tag.lower(), "url": attr})
+        # <link> only counts when it is a stylesheet; canonical, pingback and
+        # alternate links are not fetched by the browser.
+        mixed = [m for m in mixed if m["tag"] != "link"
+                 or re.search(r"<link\b[^>]*rel=[\"'][^\"']*stylesheet[^\"']*[\"'][^>]*"
+                              + re.escape(m["url"]), body, flags=re.I)]
+        mixed = mixed[:20]
+
     data = {
+        "platform": ctx.manifest["meta"]["platform"],
+        "mixed_content": mixed,
         "status": status,
         "headers": {k: v for k, v in hdrs.items() if not k.startswith("_")},
         "missing": [h for h, _, _ in SECURITY_HEADERS if h not in hdrs],
         "leaky": {h: hdrs[h] for h in LEAKY_HEADERS if h in hdrs},
         "cookies": cookies,
-        "generators": re.findall(
-            r'<meta name="generator" content="([^"]+)"', body),
-        "theme": sorted(set(re.findall(
-            r"/wp-content/themes/([^/\"']+)/", body))),
+        "generators": generators,
+        "core_versions": core_versions,
+        "theme": themes,
+        "theme_info": theme_info,
         "homepage_plugins": sorted(set(re.findall(
             r"/wp-content/plugins/([^/\"']+)/", body))),
+        "edge": edge["edge"],
+        "challenged": edge["challenged"],
     }
     ctx.write("headers", data)
-    return "ok", 1, ""
+    if edge["challenged"] or status != 200:
+        # Reading security headers off a block page grades the WAF, not the
+        # site, and every module after this one is reading the same wall.
+        return ("error", 1,
+                f"the homepage answered HTTP {status} with a "
+                f"{'challenge or block page' if edge['challenged'] else 'non-success response'}"
+                + (f" from {', '.join(edge['edge'])}" if edge["edge"] else "")
+                + "; this run is seeing the edge, not the site")
+    return "ok", 1, (f"in front: {', '.join(edge['edge'])}" if edge["edge"] else "")
 
 
 def collect_rest(ctx: RunContext) -> Tuple[str, int, str]:
@@ -1195,11 +1727,45 @@ def collect_rest(ctx: RunContext) -> Tuple[str, int, str]:
     what a POST endpoint accepts means submitting, which this tool does not
     do.
     """
-    status, _, data = fetch_json(ctx.site + "/wp-json/")
+    attempts = []
+    data = None
+    for base, url in (("/wp-json", ctx.site + "/wp-json/"),
+                      ("/?rest_route=", ctx.site + "/?rest_route=/")):
+        status, hdrs, data = fetch_json(url, max_bytes=REST_INDEX_MAX_BYTES)
+        attempts.append({"base": base, "status": status,
+                         "truncated": bool(hdrs.get("_truncated")),
+                         "json": isinstance(data, dict)})
+        if isinstance(data, dict) and "routes" in data:
+            ctx.manifest["meta"]["rest_base"] = base
+            ctx.save()
+            break
+        data = None
     if not isinstance(data, dict):
-        ctx.write("rest", {})
+        ctx.write("rest", {"attempts": attempts})
+        first = attempts[0]
+        if first["truncated"]:
+            return ("error", 0,
+                    f"the REST index is larger than {REST_INDEX_MAX_BYTES:,} "
+                    "bytes and could not be read in full")
+        if first["status"] == 200:
+            # A 200 that is not JSON is a challenge page or an HTML page at
+            # /wp-json/. Neither is "safer"; the API was not readable by this
+            # run and may be readable by a browser.
+            return ("error", 0,
+                    "/wp-json/ and /?rest_route=/ both answered HTTP 200 "
+                    "without JSON, so the REST API could not be read; a "
+                    "challenge page or a non-WordPress front end is the "
+                    "usual cause")
+        if any(a["status"] in (429, 503, 0) for a in attempts):
+            return ("error", 0,
+                    "the REST index could not be read: HTTP "
+                    + "/".join(str(a["status"]) for a in attempts)
+                    + " (rate limited or unreachable). This is not the safer "
+                    "state; the endpoint was not examined")
         return ("empty", 0,
-                f"/wp-json/ returned HTTP {status} and no JSON, which is the "
+                f"/wp-json/ returned HTTP {first['status']} and "
+                f"/?rest_route=/ returned HTTP {attempts[-1]['status']}, so "
+                "the REST index is not anonymously readable, which is the "
                 "safer state")
     routes = data.get("routes", {}) or {}
     namespaces = data.get("namespaces", []) or []
@@ -1209,17 +1775,39 @@ def collect_rest(ctx: RunContext) -> Tuple[str, int, str]:
                           for m in ep.get("methods", [])})
         if set(methods) - {"GET", "HEAD"}:
             write_routes.append({"route": route, "methods": methods})
+    third_party = [n for n in namespaces if n not in CORE_NAMESPACES]
+
+    # A plugin known only from its namespace has no asset URL to read a
+    # version from. Where the namespace maps to a known directory slug, its
+    # own readme.txt supplies one. Only slugs the site itself advertised are
+    # requested; nothing is guessed.
+    namespace_plugins: Dict[str, Dict] = {}
+    for ns in third_party:
+        if shutdown_requested:
+            break
+        name, slug = NAMESPACE_PLUGINS.get(ns, (ns, None))
+        if not slug or slug in namespace_plugins:
+            continue
+        tag = _readme_stable_tag(ctx.site, slug)
+        namespace_plugins[slug] = {"name": name, "namespace": ns,
+                                   "readme_version": tag}
     ctx.write("rest", {
         "name": data.get("name", ""),
         "description": data.get("description", ""),
         "home": data.get("home", ""),
+        "base": ctx.manifest["meta"].get("rest_base", "/wp-json"),
+        "attempts": attempts,
         "route_count": len(routes),
         "namespaces": namespaces,
-        "third_party": [n for n in namespaces if n not in CORE_NAMESPACES],
+        "third_party": third_party,
+        "namespace_plugins": namespace_plugins,
         "write_routes": write_routes,
         "authentication": data.get("authentication", {}),
     })
-    return "ok", len(routes), ""
+    note = ""
+    if ctx.manifest["meta"].get("rest_base") != "/wp-json":
+        note = "read via /?rest_route=/ because /wp-json/ did not answer"
+    return "ok", len(routes), note
 
 
 def collect_users(ctx: RunContext) -> Tuple[str, int, str]:
@@ -1235,8 +1823,7 @@ def collect_users(ctx: RunContext) -> Tuple[str, int, str]:
     result: Dict = {"rest": [], "author_redirect": [], "sitemap": [],
                     "oembed": ""}
 
-    status, hdrs, data = fetch_json(
-        ctx.site + "/wp-json/wp/v2/users?per_page=100")
+    status, hdrs, data = fetch_json(ctx.rest_url("/wp/v2/users?per_page=100"))
     result["rest_status"] = status
     result["rest_total"] = hdrs.get("x-wp-total", "")
     if isinstance(data, list):
@@ -1266,9 +1853,8 @@ def collect_users(ctx: RunContext) -> Tuple[str, int, str]:
     if status == 200 and "<loc>" in body:
         result["sitemap"] = re.findall(r"<loc>([^<]+)</loc>", body)[:100]
 
-    status, _, data = fetch_json(
-        ctx.site + "/wp-json/oembed/1.0/embed?url="
-        + urllib.parse.quote(ctx.site + "/", safe=""))
+    status, _, data = fetch_json(ctx.rest_url(
+        "/oembed/1.0/embed?url=" + urllib.parse.quote(ctx.site + "/", safe="")))
     if isinstance(data, dict):
         author = data.get("author_name", "")
         provider = data.get("provider_name", "")
@@ -1294,29 +1880,38 @@ def collect_media(ctx: RunContext) -> Tuple[str, int, str]:
     "absent from the library" and the difference decides whether a document
     can be found in wp-admin.
     """
-    probe_status, hdrs, _ = fetch_json(
-        ctx.site + "/wp-json/wp/v2/media?per_page=1&_fields=id")
-    if probe_status != 200:
+    probe_status, hdrs, probe = fetch_json(
+        ctx.rest_url("/wp/v2/media?per_page=1&_fields=id"))
+    if probe_status != 200 or not isinstance(probe, list):
         ctx.write("media", {})
         return ("empty", 0,
-                f"the media endpoint returned HTTP {probe_status}, so the "
-                "library is not anonymously enumerable, which is the safer "
-                "state")
+                f"the media endpoint returned HTTP {probe_status}"
+                + ("" if probe_status != 200 else " without JSON")
+                + ", so the library is not anonymously enumerable, which is "
+                "the safer state")
     try:
         reported_total = int(hdrs.get("x-wp-total", "0"))
     except ValueError:
         reported_total = 0
+    header_missing = "x-wp-total" not in hdrs
 
     items: List[Dict] = []
     pages: List[Dict] = []
     page = 1
     stopped = ""
-    while page <= MEDIA_MAX_PAGES:
+    while True:
+        if page > MEDIA_MAX_PAGES:
+            # Leaving the loop on the cap without saying so made the gap look
+            # like WordPress filtering when it was this tool giving up.
+            stopped = (f"stopped at the {MEDIA_MAX_PAGES}-page limit "
+                       f"({MEDIA_MAX_PAGES * 100} items)")
+            break
         if shutdown_requested:
             stopped = "stopped by the operator"
             break
-        url = (f"{ctx.site}/wp-json/wp/v2/media?per_page=100&page={page}"
-               "&_fields=id,date,link,source_url,mime_type,title,status")
+        url = ctx.rest_url(
+            f"/wp/v2/media?per_page=100&page={page}"
+            "&_fields=id,date,link,source_url,mime_type,title,status")
         status, _, data = fetch_json(url)
         if status == 400:            # WordPress returns 400 past the last page
             break
@@ -1339,6 +1934,7 @@ def collect_media(ctx: RunContext) -> Tuple[str, int, str]:
             in DOC_EXT]
     data = {
         "reported_total": reported_total,
+        "header_missing": header_missing,
         "walked": len(items),
         "gap": max(0, reported_total - len(items)),
         "pages": pages,
@@ -1356,7 +1952,12 @@ def collect_media(ctx: RunContext) -> Tuple[str, int, str]:
     if data["gap"]:
         note = (f"the walk returned {data['walked']} of the "
                 f"{reported_total} items the endpoint reports; "
-                f"{data['gap']} were filtered out and are not covered"
+                f"{data['gap']} are not covered"
+                + (f"; {stopped}" if stopped else
+                   "; WordPress filtered them out after paging"))
+    elif header_missing:
+        note = ("the endpoint sent no X-WP-Total header, so the walk cannot "
+                "be compared against the library size"
                 + (f"; {stopped}" if stopped else ""))
     return ("partial" if stopped else "ok"), len(items), note
 
@@ -1380,11 +1981,21 @@ def collect_documents(ctx: RunContext) -> Tuple[str, int, str]:
     ctx.manifest["meta"]["extra_urls"] = merged
     ctx.save()
     extra = [u if u.startswith("http") else ctx.site + u for u in merged]
+    if ctx.data("media") is None and not extra:
+        # Nothing to confirm. "ok, 0 rows" here read as "no documents" when
+        # the media module had been skipped and no document was ever listed.
+        ctx.write("documents", [])
+        return ("skipped", 0, "depends on the media module, which did not "
+                              "run, and no --url was given")
     rows = []
     for url in candidates + [u for u in extra if u not in candidates]:
         if shutdown_requested:
             break
         status, hdrs, _ = fetch(url, method="HEAD")
+        if status in (405, 501):
+            # Some hosts refuse HEAD. A GET capped at one byte of body is
+            # the same question asked politely.
+            status, hdrs, _ = fetch(url, max_bytes=1)
         name = urllib.parse.urlparse(url).path.lower()
         rows.append({
             "url": url,
@@ -1418,12 +2029,17 @@ def collect_assets(ctx: RunContext) -> Tuple[str, int, str]:
         urls = [ctx.site + "/"]
     plugins: Dict[str, Dict] = {}
     page_rows = []
+    failed: Dict[int, int] = {}
     for url in urls:
         if shutdown_requested:
             break
         bust = f"{'&' if '?' in url else '?'}nc={uuid.uuid4().hex[:8]}"
         status, hdrs, body = fetch(url + bust)
         if status != 200:
+            # Skipping silently hid a WAF that started answering 429 thirty
+            # pages in; the sweep then covered half the site and said so
+            # nowhere.
+            failed[status] = failed.get(status, 0) + 1
             continue
         cache = (hdrs.get("x-kinsta-cache") or hdrs.get("x-cache")
                  or hdrs.get("cf-cache-status") or hdrs.get("x-litespeed-cache")
@@ -1457,12 +2073,24 @@ def collect_assets(ctx: RunContext) -> Tuple[str, int, str]:
             "cache": cache,
             "plugins": sorted({f"{s} {v}" for s, v in seen_here}),
         })
+    # readme.txt as a second witness. It is independent of the page cache and
+    # of the ?ver= string, and it is the only version source for a plugin
+    # whose assets carry a cache-buster instead of a release number.
+    for slug, entry in plugins.items():
+        if shutdown_requested:
+            break
+        tag = _readme_stable_tag(ctx.site, slug)
+        entry["readme_version"] = tag
+        if tag and not entry["versions"]:
+            entry["versions"][tag] = 0
     data = {
         "pages_checked": len(page_rows),
         "pages_in_sitemap": len(urls),
+        "pages_failed": failed,
         "cache_states": sorted({r["cache"] for r in page_rows if r["cache"]}),
         "plugins": {slug: {
             "versions": sorted(v["versions"]),
+            "readme_version": v.get("readme_version", ""),
             "pages": v["pages"],
         } for slug, v in sorted(plugins.items())},
         "pages": page_rows,
@@ -1470,12 +2098,18 @@ def collect_assets(ctx: RunContext) -> Tuple[str, int, str]:
     ctx.write("assets", data)
     cached = [r for r in page_rows
               if r["cache"].upper() in ("HIT", "CACHED")]
-    note = ""
+    notes = []
     if cached:
-        note = (f"{len(cached)} page(s) were served from cache despite the "
-                "cache-busting parameter, so their version numbers may be "
-                "stale")
-    return "ok", len(page_rows), note
+        notes.append(f"{len(cached)} page(s) were served from cache despite "
+                     "the cache-busting parameter, so their version numbers "
+                     "may be stale")
+    if failed:
+        notes.append(f"{sum(failed.values())} of {len(urls)} page(s) did not "
+                     "answer 200 and were not read ("
+                     + ", ".join(f"HTTP {s} x{n}" for s, n in sorted(failed.items()))
+                     + ")")
+    status = "partial" if failed and sum(failed.values()) * 4 > len(urls) else "ok"
+    return status, len(page_rows), "; ".join(notes)
 
 
 def _sitemap_urls(site: str) -> List[str]:
@@ -1531,8 +2165,21 @@ def collect_vulns(ctx: RunContext) -> Tuple[str, int, str]:
     """
     assets = ctx.data("assets") or {}
     headers = ctx.data("headers") or {}
-    plugins = assets.get("plugins", {})
+    rest = ctx.data("rest") or {}
+    plugins: Dict[str, Dict] = {
+        slug: dict(info, source="assets")
+        for slug, info in assets.get("plugins", {}).items()}
+    # Plugins known only from a REST namespace, with the version their own
+    # readme.txt gave. This is where the security and caching plugins live:
+    # they load nothing on the front end and never appear in asset URLs.
+    for slug, info in (rest.get("namespace_plugins") or {}).items():
+        if slug in plugins:
+            continue
+        tag = info.get("readme_version", "")
+        plugins[slug] = {"versions": [tag] if tag else [], "pages": 0,
+                         "readme_version": tag, "source": "rest namespace"}
     theme_slugs = headers.get("theme", []) or []
+    theme_info = headers.get("theme_info", {}) or {}
 
     data: Dict = {
         "checked_at": datetime.now().isoformat(timespec="seconds"),
@@ -1544,15 +2191,31 @@ def collect_vulns(ctx: RunContext) -> Tuple[str, int, str]:
         "core": {}, "plugins": {}, "themes": {},
     }
 
-    # Core. The version is whatever the generator tag disclosed; on a hardened
-    # site there is none, and then only the current release is reported.
+    # Core. Every source the headers module found is kept; the generator tag
+    # is preferred when present, and a disagreement between sources is
+    # recorded because it means one of them is a cached copy.
     releases = _wporg(WPORG_STABLE_CHECK) or {}
     latest_core = next((v for v, state in releases.items() if state == "latest"), "")
-    generator = next((g for g in headers.get("generators", [])
-                      if g.lower().startswith("wordpress")), "")
-    detected_core = (re.sub(r"^wordpress\s*", "", generator, flags=re.I).strip()
-                     if generator else "")
+    sources: Dict[str, str] = dict(headers.get("core_versions") or {})
+    if not sources:
+        generator = next((g for g in headers.get("generators", [])
+                          if g.lower().startswith("wordpress")), "")
+        if generator:
+            sources["generator"] = re.sub(r"^wordpress\s*", "", generator,
+                                          flags=re.I).strip()
+    # The asset reading only corroborates; it never stands alone. On its own it
+    # once produced "WordPress 3.7.1 has 450 published vulnerabilities" for a
+    # site on 7.x, because 3.7.1 was jQuery's version. The generator tag and
+    # the feed are written by WordPress itself.
+    detected_core = ""
+    for key in ("generator (cache-busted)", "generator", "feed"):
+        if sources.get(key):
+            detected_core = sources[key]
+            break
+    distinct = sorted({v for v in sources.values() if v})
     core: Dict = {"detected": detected_core, "latest": latest_core,
+                  "sources": sources,
+                  "sources_disagree": len(distinct) > 1,
                   "releases_listed": len(releases),
                   "majors": sorted({".".join(v.split(".")[:2])
                                     for v in releases if version_ordered(v)},
@@ -1578,7 +2241,15 @@ def collect_vulns(ctx: RunContext) -> Tuple[str, int, str]:
             break
         versions = [v for v in info.get("versions", []) if version_ordered(v)]
         entry: Dict = {"detected_versions": info.get("versions", []),
+                       "readme_version": info.get("readme_version", ""),
+                       "source": info.get("source", "assets"),
                        "pages": info.get("pages", 0)}
+        # readme.txt disagreeing with the asset URLs means one of them is
+        # stale. Both are tested, and the report names the disagreement.
+        readme = entry["readme_version"]
+        if readme and version_ordered(readme) and readme not in versions:
+            entry["version_conflict"] = True
+            versions.append(readme)
         entry["wporg"] = _currency(WPORG_PLUGIN_API.format(slug=slug), versions)
         lookup = _wpvuln("plugin", slug)
         entry["covered"] = lookup["covered"]
@@ -1600,19 +2271,31 @@ def collect_vulns(ctx: RunContext) -> Tuple[str, int, str]:
         entry["undecidable"] = undecidable
         data["plugins"][slug] = entry
 
-    # Themes. The homepage names the active theme but never its version, so
-    # this is a currency and coverage check only; a theme vulnerability cannot
-    # be matched without a version and the report says so.
+    # Themes. The homepage names the theme directory; style.css, read by the
+    # headers module, supplies the version. Without it this is a currency and
+    # coverage check only and the report says so.
     for slug in theme_slugs:
         if shutdown_requested:
             break
-        entry = {"wporg": _currency(WPORG_THEME_API.format(slug=slug), [])}
+        style = theme_info.get(slug) or {}
+        version = style.get("version", "")
+        versions = [version] if version and version_ordered(version) else []
+        entry = {"detected_versions": versions,
+                 "theme_name": style.get("name", ""),
+                 "parent": style.get("parent", ""),
+                 "pages": 0,
+                 "wporg": _currency(WPORG_THEME_API.format(slug=slug), versions)}
         lookup = _wpvuln("theme", slug)
         entry["covered"] = lookup["covered"]
         entry["lookup_error"] = lookup["error"]
         entry["total_records"] = len(lookup["record"].get("vulnerability") or [])
-        entry["vulnerabilities"] = []
-        entry["undecidable"] = 0
+        rows: List[Dict] = []
+        undecidable = 0
+        if versions:
+            rows, undecidable = _vuln_rows(lookup["record"], versions[0])
+            rows = [dict(r, affected_version=versions[0]) for r in rows]
+        entry["vulnerabilities"] = rows
+        entry["undecidable"] = undecidable
         data["themes"][slug] = entry
 
     ctx.write("vulns", data)
@@ -1706,10 +2389,16 @@ def collect_transport(ctx: RunContext) -> Tuple[str, int, str]:
     # so a 200 here discloses nothing. What matters is that anyone can trigger
     # it, repeatedly, for free. Reported as context, never as a readable file:
     # it sat in the "paths readable that should not be" table for one report
-    # and read as though PHP source had been served.
+    # and read as though PHP source had been served. "Answering" means a
+    # direct 200 with nothing in it; a 200 reached through a redirect, or one
+    # carrying a page, is the host's block page or the homepage, and one run
+    # reported a 275 KB homepage as wp-cron "returning an empty response".
+    cron_direct, _ = fetch_no_redirect(ctx.site + "/wp-cron.php")
     status, _, body = fetch(ctx.site + "/wp-cron.php")
-    data["wp_cron"] = {"status": status, "bytes": len(body),
-                       "answering": status == 200}
+    data["wp_cron"] = {"status": status, "direct_status": cron_direct,
+                       "bytes": len(body),
+                       "answering": (status == 200 and cron_direct == 200
+                                     and not body.strip())}
 
     status, _, body = fetch(ctx.site + "/robots.txt")
     data["robots"] = {"status": status,
@@ -1761,6 +2450,22 @@ def collect_dns(ctx: RunContext) -> Tuple[str, int, str]:
     data["spf"] = spf[0] if spf else ""
     data["dmarc"] = dmarc[0] if dmarc else ""
     data["dmarc_delegated_to"] = cname if cname and not dmarc else ""
+    # DMARC is inherited. A subdomain with no _dmarc record of its own is
+    # covered by the organisational domain's policy (sp= if present, else
+    # p=), so "blogs.example.com publishes no DMARC record" is wrong when
+    # example.com does. Walk up until a record is found or two labels remain.
+    data["dmarc_parent"] = ""
+    data["dmarc_parent_record"] = ""
+    if not dmarc and not cname:
+        labels = domain.split(".")
+        for i in range(1, len(labels) - 1):
+            parent = ".".join(labels[i:])
+            found = [r for r in _dns_txt("_dmarc." + parent)
+                     if r.lower().startswith("v=dmarc1")]
+            if found:
+                data["dmarc_parent"] = parent
+                data["dmarc_parent_record"] = found[0]
+                break
     data["mx"] = _dns_mx(domain)
     ctx.write("dns", data)
     return "ok", 1, ""
@@ -1813,10 +2518,6 @@ MODULES: List[Dict] = [
      "fn": collect_headers, "required": True,
      "about": "Reads the homepage for security response headers, version "
               "disclosure, cookie flags and the theme."},
-    {"key": "paths", "title": "Readable paths",
-     "fn": collect_paths, "required": False,
-     "about": "Requests backup archives, database dumps, credential files, "
-              "logs and directory listings that should not be readable."},
     {"key": "rest", "title": "REST API index",
      "fn": collect_rest, "required": False,
      "about": "Reads /wp-json/ for the plugin inventory and any route that "
@@ -1843,6 +2544,16 @@ MODULES: List[Dict] = [
               "against api.wordpress.org for currency and withdrawal, and "
               "wpvulnerability.net for published CVEs. Components with no "
               "record are reported as unchecked, never as clean."},
+    # The path sweep is the one burst in a run (fifty-odd paths, two requests
+    # each) and it is what trips rate limiters. It runs after the modules
+    # whose data the vulnerability lookups depend on, so a WAF that starts
+    # refusing halfway through costs path coverage rather than the inventory.
+    {"key": "paths", "title": "Readable paths",
+     "fn": collect_paths, "required": False,
+     "about": "Requests backup archives, database dumps, credential files, "
+              "logs, developer artefacts, form-upload directories and "
+              "directory listings that should not be readable, plus backup "
+              "names derived from the domain and the paths robots.txt hides."},
     {"key": "transport", "title": "Transport and TLS",
      "fn": collect_transport, "required": False,
      "about": "HTTP-to-HTTPS behaviour, the certificate, CORS, XML-RPC and "
@@ -1854,6 +2565,11 @@ MODULES: List[Dict] = [
 ]
 
 MODULE_BY_KEY = {m["key"]: m for m in MODULES}
+
+# Modules that only mean something on WordPress. On any other site they are
+# marked "not applicable" rather than run, because "empty" would read as
+# hardened. The paths module stays: half its list applies to any site.
+WORDPRESS_ONLY_MODULES = {"rest", "users", "media", "documents", "assets", "vulns"}
 
 
 def selected_modules(args) -> List[Dict]:
@@ -1880,6 +2596,26 @@ def collect(ctx: RunContext, modules: List[Dict]):
         if shutdown_requested:
             ctx.set_module(key, "skipped", 0, "stopped by the operator")
             continue
+        # Calibration is load-bearing: without a trustworthy signature the
+        # path module reports either fiction or nothing. An earlier version
+        # marked paths "skipped" here and then ran it anyway two iterations
+        # later, because the loop only honoured "ok". Found on a live run.
+        if key == "paths" and ctx.module_status("calibration") == "error":
+            ctx.set_module("paths", "skipped", 0,
+                           "calibration failed, so a path result could not "
+                           "be told apart from a 404")
+            print_warning("paths: skipped, calibration could not be trusted")
+            continue
+        platform = ctx.manifest["meta"].get("platform", {})
+        if (key in WORDPRESS_ONLY_MODULES and platform.get("decided")
+                and not platform.get("wordpress")):
+            ctx.set_module(key, "not applicable", 0,
+                           "no WordPress markers were found on this site "
+                           "(wp-content, wp-includes, generator tag, REST "
+                           "discovery link, wp-login.php), so this "
+                           "WordPress-specific check does not apply")
+            print_info(f"{key}: not applicable, this is not a WordPress site")
+            continue
         started = time.time()
         try:
             status, rows, note = mod["fn"](ctx)
@@ -1896,17 +2632,9 @@ def collect(ctx: RunContext, modules: List[Dict]):
             print_error(f"{line} - {note}")
         else:
             print_warning(f"{line} - {note}" if note else line)
-        # Calibration is load-bearing: without a trustworthy signature the
-        # path module reports either fiction or nothing, so stop rather than
-        # produce a report that cannot be read either way.
         if key == "calibration" and status == "error":
             print_error("Calibration could not be trusted; the paths module "
                         "will not run. See the report's Methodology section.")
-            for later in modules:
-                if later["key"] == "paths":
-                    ctx.set_module("paths", "skipped", 0,
-                                   "calibration failed, so a path result "
-                                   "could not be told apart from a 404")
 
 
 ###############################################################################
@@ -1938,14 +2666,56 @@ def check_paths(ctx: RunContext) -> List[Finding]:
     ambiguous = calibration_is_ambiguous(ctx.missing_signature)
     findings = []
     by_severity: Dict[str, List[Dict]] = {}
+    empties: List[Dict] = []
     for row in rows:
-        if row["exposed"]:
-            by_severity.setdefault(row["severity"], []).append(row)
+        if not row["exposed"]:
+            continue
+        if not row["bytes"] and not row["path"].endswith("/"):
+            # A 0-byte 200 is a real file with nothing in it, or a server
+            # rule that answers 200 for a blocked path. Neither supports the
+            # severity the path would earn with content, so these get their
+            # own INFO finding rather than a seat in the CRITICAL table.
+            empties.append(row)
+            continue
+        by_severity.setdefault(row["severity"], []).append(row)
+
+    if empties:
+        findings.append(Finding(
+            "paths-empty", "INFO",
+            f"{len(empties)} path(s) answered HTTP 200 with an empty body",
+            "The server answered as though the file exists but sent nothing. "
+            "That is either an empty file or a web-server rule that returns "
+            "200 for a path it blocks. Nothing was read, so this is not an "
+            "exposure; it is a prompt to look, because an empty backup file "
+            "or an empty .env in the web root means one was there at some "
+            "point.",
+            "Check each path on the server. If a file exists, delete it and "
+            "ask how it got there; if a rule is answering, consider returning "
+            "404 instead so the path does not confirm anything.",
+            [{"Path": r["path"], "Status": r["status"],
+              "What it would be": r["why"]} for r in empties],
+            "paths.json", len(empties)))
 
     for severity, hits in by_severity.items():
         evidence = [{"Path": h["path"], "Status": h["status"],
                      "Bytes": h["bytes"], "Type": h["content_type"],
                      "What it gives away": h["why"]} for h in hits]
+        if severity == "INFO":
+            findings.append(Finding(
+                "paths-robots", "INFO",
+                f"{len(hits)} path(s) the site's own robots.txt hides from "
+                "search engines are readable",
+                "robots.txt is public, and its Disallow lines are the site "
+                "owner's own list of things they did not want indexed. "
+                "Attackers read it as a shortlist. Each listed path was "
+                "requested; these answered with content. A page that is "
+                "public but unindexed is normal. A directory, an export or an "
+                "admin screen in this list is not.",
+                "Look at what each path serves. Anything that should not be "
+                "public needs a login or removal, not a robots.txt line, "
+                "which only asks well-behaved crawlers to look away.",
+                evidence, "paths.json", len(hits)))
+            continue
         if ambiguous:
             findings.append(Finding(
                 f"paths-{severity.lower()}", "INFO",
@@ -2005,6 +2775,9 @@ def check_headers(ctx: RunContext) -> List[Finding]:
     if not data:
         return []
     findings = []
+    if data.get("status") != 200 or data.get("challenged"):
+        # The headers of a block page describe the WAF, not the site.
+        return findings
     missing = data.get("missing", [])
     by_sev = {}
     for header, severity, cost in SECURITY_HEADERS:
@@ -2026,8 +2799,10 @@ def check_headers(ctx: RunContext) -> List[Finding]:
             rows, "headers.json", len(rows)))
 
     leaky = data.get("leaky", {})
-    interesting = {k: v for k, v in leaky.items()
-                   if k != "server" or re.search(r"\d", v or "")}
+    # A value with no number in it names a product, not a version, and the
+    # finding below is about versions. "x-powered-by: WP Engine" and
+    # "x-redirect-by: WordPress" were both reported as version disclosure.
+    interesting = {k: v for k, v in leaky.items() if re.search(r"\d", v or "")}
     if interesting:
         findings.append(Finding(
             "headers-leaky", "LOW",
@@ -2058,6 +2833,26 @@ def check_headers(ctx: RunContext) -> List[Finding]:
               "HttpOnly": "yes" if c["httponly"] else "NO",
               "SameSite": "yes" if c["samesite"] else "no"}
              for c in insecure], "headers.json"))
+
+    mixed = data.get("mixed_content", [])
+    if mixed:
+        active = [m for m in mixed if m["tag"] in ("script", "iframe", "link")]
+        findings.append(Finding(
+            "headers-mixed", "MEDIUM" if active else "LOW",
+            f"{len(mixed)} resource(s) on the homepage load over plain HTTP",
+            "The page is served over HTTPS but asks the browser to fetch "
+            + ("scripts or stylesheets" if active else "images or media")
+            + " over plain HTTP. Browsers block scripts and stylesheets "
+            "loaded this way, so part of the page is broken for every "
+            "visitor; images and media still load but the address bar loses "
+            "its padlock. Either way anyone on the network path can read or "
+            "swap what is fetched.",
+            "Change each URL to https:// or to a scheme-relative //host/path. "
+            "For a WordPress site, run a search-and-replace on the database "
+            "for http://<your domain> after confirming the Site Address in "
+            "Settings > General starts with https.",
+            [{"Tag": m["tag"], "URL": m["url"]} for m in mixed],
+            "headers.json", len(mixed)))
 
     generators = data.get("generators", [])
     wp_version = next((g for g in generators if g.lower().startswith("wordpress")), "")
@@ -2116,18 +2911,38 @@ def check_users(ctx: RunContext) -> List[Finding]:
                  for u in rest if not u.get("slug")], "users.json"))
 
     redirects = data.get("author_redirect", [])
-    if redirects:
+    sitemap = data.get("sitemap", [])
+    if redirects or sitemap:
+        # One finding for both routes: they publish the same slug, and two
+        # sections saying so would be the same disclosure counted twice. The
+        # users sitemap was collected and never reported for one release;
+        # on one live site that was 61 author URLs the report knew about and
+        # said nothing.
+        routes = []
+        if redirects:
+            routes.append("?author=N")
+        if sitemap:
+            routes.append("the users sitemap")
+        evidence = [{"Route": f"?author={r['n']}", "Author slug": r["slug"]}
+                    for r in redirects]
+        evidence += [{"Route": "wp-sitemap-users-1.xml",
+                      "Author slug": u.rstrip("/").rsplit("/", 1)[-1]}
+                     for u in sitemap]
         findings.append(Finding(
             "users-author", "MEDIUM",
-            "?author=N still reveals author slugs",
-            "This is the older enumeration route and it outlives the REST "
-            "endpoint: /?author=1 redirects to /author/<slug>/, and that "
-            "slug is the same user_nicename the REST endpoint publishes. "
-            "Closing only the REST endpoint leaves this open.",
+            f"Author slugs are published through {' and '.join(routes)}",
+            "These are the older enumeration routes and they outlive the "
+            "REST endpoint. /?author=1 redirects to /author/<slug>/, and the "
+            "users sitemap lists every author archive URL; both carry the "
+            "same user_nicename the REST endpoint publishes. Closing only the "
+            "REST endpoint leaves these open. On a publication with many "
+            "named authors this is expected; the point is that the slug, "
+            "which is often the login name, travels with the name.",
             "Block the author query string at the web server, or return a "
-            "404 for author archives if the site does not use them.",
-            [{"Query": f"?author={r['n']}", "Redirects to slug": r["slug"]}
-             for r in redirects], "users.json"))
+            "404 for author archives if the site does not use them. Remove "
+            "the users sitemap with the wp_sitemaps_add_provider filter if "
+            "author archives are not meant to be discovered.",
+            evidence, "users.json", len(evidence)))
 
     if data.get("oembed"):
         findings.append(Finding(
@@ -2149,11 +2964,14 @@ def check_media(ctx: RunContext) -> List[Finding]:
     findings = []
     total = data.get("reported_total", 0)
     walked = data.get("walked", 0)
-    if total:
+    if total or walked:
+        # A host that strips X-WP-Total leaves total at 0. The library was
+        # still walked, and a finding gated on the header alone vanished.
         findings.append(Finding(
             "media-open", "MEDIUM",
             f"The media library is enumerable without a login "
-            f"({total} items)",
+            f"({total or walked} items"
+            f"{'' if total else ', counted by walking; no total was sent'})",
             "Anyone can page through every file ever uploaded, including "
             "files no page links to. Closing this stops bulk enumeration and "
             "protects no individual file, because an upload is readable by "
@@ -2303,18 +3121,23 @@ def check_rest(ctx: RunContext) -> List[Finding]:
     rpc = [r for r in data.get("write_routes", [])
            if any(hint in r["route"].lower() for hint in RPC_NAMESPACE_HINTS)]
     if rpc:
+        # MEDIUM, not HIGH. The evidence is a route name and an advertised
+        # write method; WordPress routes almost always require authentication
+        # for writes and the index does not say. A Jetpack settings route
+        # earned HIGH on the word "mcp" alone before this was lowered.
         findings.append(Finding(
-            "rest-rpc", "HIGH",
+            "rest-rpc", "MEDIUM",
             f"{len(rpc)} route(s) accept write methods and look like a "
             "remote-control interface",
             "These routes advertise POST, PUT or DELETE and sit in a "
             "namespace that exists to drive the site programmatically. "
             "Whether they accept an anonymous call is UNKNOWN and was "
             "deliberately not tested, because finding out means sending a "
-            "POST, which is submitting rather than observing. Unknown is "
-            "not the same as safe: an unauthenticated route of this shape "
-            "is a way to change the site, so resolve it rather than filing "
-            "it.",
+            "POST, which is submitting rather than observing. Most WordPress "
+            "routes require authentication for writes, which is why this is "
+            "rated medium on the evidence of a name; an unauthenticated route "
+            "of this shape would be a way to change the site, so resolve it "
+            "rather than filing it.",
             "Determine from the plugin's own documentation or its source "
             "what authentication these routes require. If the plugin is not "
             "in use, remove it rather than deactivating it. If it is, "
@@ -2352,22 +3175,65 @@ def check_assets(ctx: RunContext) -> List[Finding]:
               "Pages carrying it": info["pages"]}
              for slug, info in plugins.items()], "assets.json", len(plugins)))
 
-    multi = {s: i for s, i in plugins.items() if len(i["versions"]) > 1}
-    if multi:
+    # More than one version string for a plugin means one of two things, and
+    # only one is a finding. If a single page carries both, the plugin
+    # versions its own assets independently (a bundled library under its own
+    # number) and nothing is stale. Only pages that disagree with EACH OTHER,
+    # each carrying one version, point at a cache or a half-applied update.
+    # The first version of this check reported a plugin with three asset
+    # versions on every one of 26 pages as a cache problem.
+    per_page: Dict[str, List[set]] = {}
+    for page in data.get("pages", []):
+        seen: Dict[str, set] = {}
+        for item in page.get("plugins", []):
+            slug, _, version = item.rpartition(" ")
+            seen.setdefault(slug, set()).add(version)
+        for slug, versions in seen.items():
+            per_page.setdefault(slug, []).append(versions)
+    mixed = {}
+    for slug, info in plugins.items():
+        if len(info["versions"]) < 2:
+            continue
+        page_sets = per_page.get(slug, [])
+        if any(len(s) > 1 for s in page_sets):
+            continue                       # same page, several versions: by design
+        singles = {next(iter(s)) for s in page_sets if len(s) == 1}
+        if len(singles) > 1:
+            mixed[slug] = sorted(singles, key=version_key)
+    if mixed:
         findings.append(Finding(
             "assets-mixed", "MEDIUM",
-            f"{len(multi)} plugin(s) report more than one version across the "
-            "site",
-            "Different pages are serving different versions of the same "
-            "plugin. That usually means some pages are still being served "
+            f"{len(mixed)} plugin(s) are served at different versions on "
+            "different pages",
+            "Each page carries one version of the plugin, and the pages "
+            "disagree. That usually means some pages are still being served "
             "from a cache built before an update, but it can also mean a "
             "half-applied update. Either way a version read from one page "
             "cannot be trusted for the whole site.",
             "Clear the site and CDN caches, then re-run this check. If the "
             "versions still disagree, look at wp-content/upgrade/ on the "
             "server for a partly applied update.",
-            [{"Plugin": s, "Versions": ", ".join(i["versions"])}
-             for s, i in multi.items()], "assets.json", len(multi)))
+            [{"Plugin": s, "Versions": ", ".join(v)}
+             for s, v in mixed.items()], "assets.json", len(mixed)))
+
+    conflicts = {s: i for s, i in plugins.items()
+                 if i.get("readme_version") and i["versions"]
+                 and i["readme_version"] not in i["versions"]}
+    if conflicts:
+        findings.append(Finding(
+            "assets-readme", "INFO",
+            f"{len(conflicts)} plugin(s) report a different version in "
+            "readme.txt than in their asset URLs",
+            "The plugin's own readme.txt names a Stable tag that differs "
+            "from the version appended to its scripts and styles. Authors do "
+            "forget to bump one or the other, so this is not itself a "
+            "problem. It is listed because the vulnerability check below "
+            "tested both numbers, and the reader should know why two appear.",
+            "Check the version shown in Plugins > Installed Plugins, which is "
+            "the authoritative one.",
+            [{"Plugin": s, "Asset URLs say": ", ".join(i["versions"]),
+              "readme.txt says": i["readme_version"]}
+             for s, i in conflicts.items()], "assets.json", len(conflicts)))
     return findings
 
 
@@ -2388,30 +3254,50 @@ def check_vulns(ctx: RunContext) -> List[Finding]:
     themes = data.get("themes", {})
     core = data.get("core", {})
 
-    # 1. Plugins with a vulnerability whose range covers a version we saw.
-    vulnerable = {slug: entry for slug, entry in plugins.items()
+    # 1. Plugins and themes with a vulnerability whose range covers a version
+    #    we saw. Themes are here since v1.2.0, when style.css started
+    #    supplying their version.
+    vulnerable = {slug: entry for slug, entry in {**plugins, **themes}.items()
                   if entry.get("vulnerabilities")}
     if vulnerable:
-        worst = max(row["score"] for entry in vulnerable.values()
-                    for row in entry["vulnerabilities"])
         rows = []
+        worst = "INFO"
         for slug, entry in sorted(
                 vulnerable.items(),
                 key=lambda kv: -max(r["score"] for r in kv[1]["vulnerabilities"])):
             top = entry["vulnerabilities"][0]
+            severity = cvss_severity(max(r["score"] for r in entry["vulnerabilities"]))
+            matched = top.get("affected_version", "")
+            readme = entry.get("readme_version", "")
+            version_text = matched
+            if entry.get("source") == "rest namespace":
+                version_text = f"{matched} (from the plugin's readme.txt)"
+            elif entry.get("version_conflict"):
+                # Two witnesses that disagree. The match holds for one of them
+                # and the other may be current, so the component cannot carry
+                # more than MEDIUM until someone reads the Plugins screen.
+                other = readme if matched != readme else ", ".join(
+                    v for v in entry.get("detected_versions", []) if v != readme)
+                version_text = (f"{matched} per {'readme.txt' if matched == readme else 'asset URLs'}; "
+                                f"{'asset URLs say' if matched == readme else 'readme.txt says'} "
+                                f"{other}, which does not match this range. "
+                                "Confirm on the Plugins screen.")
+                severity = cap_severity(severity, "MEDIUM")
+            if SEVERITY_ORDER.index(severity) < SEVERITY_ORDER.index(worst):
+                worst = severity
             rows.append({
-                "Plugin": slug,
-                "Version running": top.get("affected_version", ""),
+                "Component": f"{slug} ({'theme' if slug in themes else 'plugin'})",
+                "Version running": version_text,
                 "Known issues": len(entry["vulnerabilities"]),
                 "Worst CVSS": f"{top['score']:.1f}" if top["score"] else "unscored",
                 "Reference": top["cve"] or top["name"][:60],
                 "Fixed in": top["fixed_in"] or ("no fix published"
                                                 if top["unfixed"] else ""),
-                "Pages carrying it": entry.get("pages", 0),
+                "Pages carrying it": entry.get("pages", 0) or "not read from pages",
             })
         findings.append(Finding(
-            "vulns-plugins", cvss_severity(worst),
-            f"{len(vulnerable)} plugin(s) are running a version with a "
+            "vulns-plugins", worst,
+            f"{len(vulnerable)} component(s) are running a version with a "
             "published vulnerability",
             "The version this site is serving falls inside the affected range "
             "of a vulnerability that has been published and given a CVE. That "
@@ -2419,11 +3305,13 @@ def check_vulns(ctx: RunContext) -> List[Finding]:
             "concept, are already public, which is what makes an unpatched "
             "plugin different from a theoretical weakness. The page count is "
             "the size of the exposed surface. Severity here is the published "
-            "CVSS base score, not this tool's opinion.",
-            "Update each plugin named below to the fixed version, then re-run "
-            "this audit to confirm the site is serving the new version rather "
-            "than a cached page. Where no fix is published, the plugin has to "
-            "be deactivated and removed until one is, or replaced.",
+            "CVSS base score, not this tool's opinion; an unscored entry is "
+            "one the database lists without a score, and it should be read "
+            "as unknown rather than as low.",
+            "Update each component named below to the fixed version, then "
+            "re-run this audit to confirm the site is serving the new version "
+            "rather than a cached page. Where no fix is published, the plugin "
+            "has to be deactivated and removed until one is, or replaced.",
             rows, "vulns.json", len(vulnerable)))
 
     # 2. Withdrawn from the directory. No vulnerability database needed, and
@@ -2511,42 +3399,52 @@ def check_vulns(ctx: RunContext) -> List[Finding]:
             stale, "vulns.json", len(stale)))
 
     # 4. Core.
+    detected = str(core.get("detected", ""))
+    sources = core.get("sources") or {}
     if core.get("vulnerabilities"):
         worst = max(row["score"] for row in core["vulnerabilities"])
-        # A generator tag reading "WordPress 7.0" names a BRANCH, not a
-        # release. The vulnerability endpoint answers for the whole branch, so
-        # entries already fixed in 7.0.1 or 7.0.4 are in that list. Reporting
-        # it as critical would put a finding in front of a client that the
-        # evidence does not support; the patch level is not visible from
-        # outside and the finding says so instead of guessing.
-        precise = len(str(core.get("detected", "")).split(".")) >= 3
-        severity = cvss_severity(worst) if precise else "MEDIUM"
+        # What the evidence supports. "WordPress 7.0" IS a release: the
+        # generator prints $wp_version verbatim, and /core/7.0/ answers for
+        # that release alone (measured: 7.0 has 12 records, 7.0.1 has 11,
+        # 7.0.2 has 5). The one real doubt is a cached page built before an
+        # update, so the severity stands only when a second, cache-busted
+        # reading agrees. When the sources disagree, or there is only one
+        # uncorroborated reading, the finding is capped and says why.
+        corroborated = (len({v for v in sources.values() if v}) == 1
+                        and len([v for v in sources.values() if v]) >= 2)
+        disagree = bool(core.get("sources_disagree"))
+        severity = cvss_severity(worst)
+        if disagree or not corroborated:
+            severity = cap_severity(severity, "MEDIUM")
+        if disagree:
+            doubt = ("The sources this tool read do not agree on the version ("
+                     + "; ".join(f"{k}: {v}" for k, v in sources.items() if v)
+                     + "), which usually means one of them is a cached copy "
+                     "built before an update. The list below is for the "
+                     "version most sources report and is something to "
+                     "confirm, not a confirmed exposure.")
+        elif not corroborated:
+            doubt = ("Only one source disclosed the version and nothing "
+                     "corroborated it, so a cached page cannot be ruled out. "
+                     "Listed as something to confirm rather than as a "
+                     "confirmed exposure.")
+        else:
+            doubt = ("The version was read from more than one source and they "
+                     "agree, so a stale cached page is unlikely. Core "
+                     "auto-updates are on by default for security releases, so "
+                     "a site sitting on a vulnerable version usually means "
+                     "auto-updates were switched off or a failed update was "
+                     "never completed.")
         findings.append(Finding(
             "vulns-core", severity,
-            f"WordPress {core.get('detected', '')}"
-            + ("" if precise else ".x")
-            + f" has {len(core['vulnerabilities'])} published "
-              "vulnerability(ies) against it",
-            ("The core version this site discloses falls inside the affected "
-             "range of a published WordPress vulnerability. Core auto-updates "
-             "are on by default for security releases, so a site sitting on a "
-             "vulnerable version usually means auto-updates were switched off "
-             "or a failed update was never completed."
-             if precise else
-             "The site discloses its WordPress branch but not its patch "
-             "release, so this is what has been published against the branch "
-             "rather than what necessarily affects this install. Several of "
-             "these are typically fixed within the branch itself, and a site "
-             "on the latest patch release may be affected by none of them. "
-             "This is listed as something to confirm, not as a confirmed "
-             "exposure - the patch level cannot be read from outside."),
-            "Check the exact version in Dashboard > Updates, which is the "
-            "only place the patch release is visible, then update core to "
-            + (core.get("latest") or "the current release")
+            f"WordPress {detected} has {len(core['vulnerabilities'])} "
+            "published vulnerability(ies) against it",
+            "The core version this site discloses falls inside the affected "
+            "range of a published WordPress vulnerability. " + doubt,
+            "Check the exact version in Dashboard > Updates, then update core "
+            "to " + (core.get("latest") or "the current release")
             + ". Confirm that automatic background updates for security "
-            "releases are enabled while you are there. The version here was "
-            "read from the generator meta tag, which can also be stale or "
-            "edited.",
+            "releases are enabled while you are there.",
             [{"Reference": row["cve"] or row["name"][:60],
               "CVSS": f"{row['score']:.1f}" if row["score"] else "unscored",
               "Details": row["reference"]}
@@ -2570,22 +3468,37 @@ def check_vulns(ctx: RunContext) -> List[Finding]:
     #    is a lie: a plugin the vulnerability database has never heard of
     #    produces the same empty result as a plugin it has cleared.
     gaps = []
+    # Core first. A core that could not be looked up, or was never
+    # identified, was absent from this list for one release, so a report on
+    # a site running a development build said nothing about core at all.
+    if not detected:
+        gaps.append({"Component": "WordPress core",
+                     "What was not checked": "no version is disclosed (generator "
+                     "tag, feed and wp-includes asset URLs were all read), so "
+                     "core could not be checked against the vulnerability data. "
+                     "Hiding it is good practice; it also means this report "
+                     "cannot say whether core is current."})
+    elif core.get("covered") is False:
+        gaps.append({"Component": f"WordPress core {detected}",
+                     "What was not checked": core.get("lookup_error")
+                     or "no vulnerability record for this version"})
     for slug, entry in sorted({**plugins, **themes}.items()):
         reasons = []
         if not entry.get("covered"):
             reasons.append(entry.get("lookup_error") or "no vulnerability record")
         if not (entry.get("wporg") or {}).get("found"):
             reasons.append("not in the wordpress.org directory")
-        if not entry.get("detected_versions") and slug in plugins:
-            reasons.append("no version could be read, so no range could be matched")
-        if slug in themes:
-            reasons.append("theme versions are not published in page HTML, so "
-                           "only currency was checked")
+        if not entry.get("detected_versions"):
+            reasons.append("no version could be read"
+                           + (" from style.css" if slug in themes else
+                              " from asset URLs or readme.txt")
+                           + ", so no range could be matched")
         if entry.get("undecidable"):
             reasons.append(f"{entry['undecidable']} record(s) used a version "
                            "range this tool does not interpret")
         if reasons:
-            gaps.append({"Component": slug, "What was not checked": "; ".join(reasons)})
+            gaps.append({"Component": f"{slug} ({'theme' if slug in themes else 'plugin'})",
+                         "What was not checked": "; ".join(reasons)})
     if gaps:
         findings.append(Finding(
             "vulns-coverage", "INFO",
@@ -2709,9 +3622,17 @@ def check_dns(ctx: RunContext) -> List[Finding]:
         return []
     findings = []
     domain = data.get("domain", "")
+    parent = data.get("dmarc_parent", "")
+    parent_record = data.get("dmarc_parent_record", "")
+    parent_policy = ""
+    if parent_record:
+        sp = re.search(r"\bsp=(\w+)", parent_record)
+        p = re.search(r"\bp=(\w+)", parent_record)
+        parent_policy = (sp or p).group(1).lower() if (sp or p) else ""
+    inherits_enforcing = parent_policy in ("quarantine", "reject")
     if not data.get("spf"):
         findings.append(Finding(
-            "dns-spf", "MEDIUM",
+            "dns-spf", "LOW" if inherits_enforcing else "MEDIUM",
             f"{domain} publishes no SPF record",
             "Without SPF, anyone can send email claiming to be from this "
             "domain and many receiving servers will accept it. This "
@@ -2721,8 +3642,29 @@ def check_dns(ctx: RunContext) -> List[Finding]:
             "If the domain sends no mail, publish a hard-fail record: "
             "v=spf1 -all. If it does, list the senders and end with ~all "
             "until the reports are clean.",
-            [{"Domain": domain, "SPF": "absent"}], "dns.json"))
-    if not data.get("dmarc") and not data.get("dmarc_delegated_to"):
+            [{"Domain": domain, "SPF": "absent"}
+             + ([{"Note": f"rated low because {parent}'s DMARC policy "
+                          f"({parent_policy}) already covers this subdomain"}]
+                if inherits_enforcing else [])], "dns.json"))
+    if not data.get("dmarc") and not data.get("dmarc_delegated_to") and parent:
+        findings.append(Finding(
+            "dns-dmarc-inherited", "INFO" if inherits_enforcing else "LOW",
+            f"{domain} has no DMARC record of its own and inherits "
+            f"{parent}'s policy ({parent_policy or 'unstated'})",
+            "DMARC is inherited: a subdomain without a _dmarc record falls "
+            "under the organisational domain's policy, using sp= where set "
+            "and p= otherwise. That is the normal arrangement and not a gap. "
+            + ("An enforcing parent policy means spoofed mail from this "
+               "subdomain is already rejected or quarantined."
+               if inherits_enforcing else
+               "The parent policy is p=none, so nothing is enforced for this "
+               "subdomain either; that is the parent domain's decision to "
+               "revisit."),
+            "Nothing to do on this subdomain. Review the parent domain's "
+            "DMARC policy if it is still p=none.",
+            [{"Subdomain": f"_dmarc.{domain}", "Inherits from": f"_dmarc.{parent}",
+              "Record": parent_record}], "dns.json"))
+    elif not data.get("dmarc") and not data.get("dmarc_delegated_to"):
         findings.append(Finding(
             "dns-dmarc", "MEDIUM",
             f"{domain} publishes no DMARC record",
@@ -2815,9 +3757,28 @@ def _profile_block(ctx: RunContext) -> str:
         if value:
             rows.append((label, value))
 
+    platform = ctx.manifest["meta"].get("platform", {})
+    add("WordPress detected",
+        ("yes, from " + ", ".join(platform.get("signals", []))
+         if platform.get("wordpress") else
+         "NO. None of the WordPress markers were found; only the "
+         "platform-neutral checks apply to this site.")
+        if platform else "")
+    add("In front of the site",
+        ", ".join(headers.get("edge", [])) or "nothing identified")
     add("Platform", ", ".join(headers.get("generators", []))
         or "not published (good)")
-    add("Theme", ", ".join(headers.get("theme", [])))
+    add("Core version by source",
+        "; ".join(f"{k}: {v}" for k, v in
+                  (headers.get("core_versions") or {}).items()))
+    theme_info = headers.get("theme_info") or {}
+    add("Theme", ", ".join(
+        f"{slug}"
+        + (f" {theme_info[slug]['version']}"
+           if theme_info.get(slug, {}).get("version") else "")
+        + (f" (child of {theme_info[slug]['parent']})"
+           if theme_info.get(slug, {}).get("parent") else "")
+        for slug in headers.get("theme", [])))
     add("Version-disclosing headers",
         ", ".join(f"{k}: {v}" for k, v in headers.get("leaky", {}).items()))
     add("Plugins named in the homepage HTML",
@@ -2864,8 +3825,12 @@ def _paths_appendix(ctx: RunContext) -> str:
         return "<p>The path module did not run, so nothing here was checked.</p>"
     body = ""
     for r in sorted(rows, key=lambda r: r["path"]):
-        verdict = "READABLE" if r["exposed"] else "not readable"
-        cls = "bad" if r["exposed"] else "good"
+        verdict = r.get("verdict") or ("readable" if r["exposed"] else "not readable")
+        verdict = verdict.upper() if r["exposed"] else verdict
+        cls = ("bad" if r["exposed"] else
+               "warn-cell" if verdict in ("no answer", "rate limited",
+                                          "answered, unexpected content")
+               else "good")
         redirect = (f" (redirect {r['no_redirect_status']})"
                     if 300 <= (r["no_redirect_status"] or 0) < 400 else "")
         body += (f"<tr><td><code>{escape(r['path'])}</code></td>"
@@ -2874,7 +3839,10 @@ def _paths_appendix(ctx: RunContext) -> str:
                  f"<td class='{cls}'>{verdict}</td></tr>")
     return (f"<p>All {len(rows)} paths requested during this run, including "
             f"the ones that came back clean. Every result below was compared "
-            f"against how this site answers a path that cannot exist.</p>"
+            f"against how this site answers a path that cannot exist. "
+            f"<em>No answer</em> and <em>rate limited</em> mean the path was "
+            f"not checked; <em>answered, unexpected content</em> means a 200 "
+            f"came back without the content that file would have.</p>"
             f"<div class='scroll'><table><thead><tr><th>Path</th>"
             f"<th>Status</th><th>Bytes</th><th>Verdict</th></tr></thead>"
             f"<tbody>{body}</tbody></table></div>")
@@ -2927,9 +3895,30 @@ def _methodology_block(ctx: RunContext) -> str:
                 "discards false hits. Without this control, a calibration "
                 "that suppressed everything would produce an empty report "
                 "and read as a clean result.</p>")
+        elif control.get("ran") is False:
+            lines.append(f"<p class='warn'><strong>The calibration control "
+                         f"could not run.</strong> {escape(control.get('note', ''))}"
+                         "</p>")
         elif control.get("note"):
             lines.append(f"<p class='warn'><strong>Calibration control "
                          f"failed.</strong> {escape(control['note'])}</p>")
+
+    headers = ctx.data("headers") or {}
+    if headers.get("edge"):
+        lines.append(
+            f"<p><strong>Something sits in front of this site:</strong> "
+            f"{escape(', '.join(headers['edge']))}. A 403 or 404 in this "
+            "report may be the edge answering rather than the file being "
+            "absent, and a version read through a cache may lag the origin. "
+            "Findings here describe what an outsider sees, which is the "
+            "point, but a clean path result behind a WAF is weaker evidence "
+            "than the same result from a bare server.</p>")
+    if headers.get("challenged"):
+        lines.append(
+            "<p class='warn'><strong>The homepage answered with a challenge "
+            "or block page.</strong> Every module after that was reading the "
+            "edge, not the site. Treat this report as a description of the "
+            "WAF and re-run from an address the WAF trusts.</p>")
 
     media = ctx.data("media") or {}
     if media.get("gap"):
@@ -2983,7 +3972,8 @@ def _coverage_block(ctx: RunContext) -> str:
         "are clean. <strong>empty</strong> means the endpoint answered but "
         "returned nothing, which is usually the safe state. "
         "<strong>partial</strong> means the rows that did come back were "
-        "collected and checked.</p>"
+        "collected and checked. <strong>not applicable</strong> means the "
+        "check is WordPress-specific and this is not a WordPress site.</p>"
         f"<div class='scroll'><table><thead><tr><th>Area</th><th>Status</th>"
         f"<th>Reason</th></tr></thead><tbody>{rows}</tbody></table></div>")
 
@@ -3053,6 +4043,7 @@ REPORT_CSS = """
   .more { color: #667; font-size: 12px; }
   .good { color: #1d7a4c; }
   .bad { color: #c0392b; font-weight: 600; }
+  .warn-cell { color: #9a6b00; font-weight: 600; }
   .warn { background: #fdf6e3; border-left: 4px solid #d4a017;
           padding: 10px 14px; border-radius: 0 4px 4px 0; }
   code { background: #f0f2f4; padding: 1px 5px; border-radius: 3px;
@@ -3132,6 +4123,14 @@ def render_html(ctx: RunContext, findings: List[Finding]) -> Path:
                 if worst else
                 "Nothing critical or high was found. Read the coverage and "
                 "methodology sections before calling the site clean.")
+    platform = ctx.manifest["meta"].get("platform", {})
+    if platform.get("decided") and not platform.get("wordpress"):
+        headline = ("This does not appear to be a WordPress site: none of "
+                    "the WordPress markers were found. Only the "
+                    "platform-neutral checks (security headers, TLS, cookies, "
+                    "mail DNS, common exposed files) were run, and the "
+                    "WordPress-specific ones are listed under Coverage gaps as "
+                    "not applicable. " + headline)
 
     generated = datetime.now().strftime("%Y-%m-%d %H:%M")
     html = f"""<!DOCTYPE html>
@@ -3429,9 +4428,16 @@ def selftest() -> int:
           bool(re.fullmatch(r"1[0-9]{9}", "1.7.0")), False)
 
     # 17. Severity comes from the published CVSS score, not from this tool.
+    #     An unscored record is unknown, and unknown is not low.
     check("9.8 is critical", cvss_severity(9.8), "CRITICAL")
     check("7.0 is high", cvss_severity(7.0), "HIGH")
     check("3.9 is low", cvss_severity(3.9), "LOW")
+    check("unscored is medium, not low", cvss_severity(0.0), "MEDIUM")
+    check("a cap lowers", cap_severity("CRITICAL", "MEDIUM"), "MEDIUM")
+    check("a cap never raises", cap_severity("LOW", "MEDIUM"), "LOW")
+    check("a redirect is labelled as one in the appendix",
+          path_verdict("/backup.zip", 200, "<h1>Home</h1>", False, 301),
+          "redirected (not a file)")
 
     # 18. Row extraction keeps the matching records and counts the rest.
     record = {"vulnerability": [
@@ -3447,6 +4453,131 @@ def selftest() -> int:
     check("only the covering record matches", [r["name"] for r in rows], ["affected"])
     check("the CVE is carried through", rows[0]["cve"], "CVE-2026-0001")
     check("an undecidable record is counted, not dropped", undecidable, 1)
+
+    # 19. Several Set-Cookie headers. A dict comprehension keeps only the
+    #     last one, and splitting on commas breaks on an Expires date. Seen
+    #     as a cookie called "21 Oct 2026 07:28:00 GMT; Path".
+    import email.message
+    msg = email.message.Message()
+    msg["Set-Cookie"] = "a=1; Path=/; Secure; HttpOnly"
+    msg["Set-Cookie"] = "b=2; Expires=Wed, 21 Oct 2026 07:28:00 GMT; Path=/"
+    joined = _headers(msg)["set-cookie"]
+    check("both cookies survive the header dict", joined.count("\n"), 1)
+    check("cookie names parse cleanly",
+          [c.split("=", 1)[0] for c in joined.split("\n")], ["a", "b"])
+
+    # 20. A path that answers 200 with the wrong content is not readable. A
+    #     WAF page or a soft 404 at /backup.sql is not a database dump.
+    check("a 200 at .sql without SQL in it is not a dump",
+          path_is_exposed("/backup.sql", 200, "<html>Blocked</html>", None, 200),
+          False)
+    check("a real dump is",
+          path_is_exposed("/backup.sql", 200, "-- MySQL dump\nCREATE TABLE x",
+                          None, 200), True)
+    check("a 200 challenge page at install.php is not an open installer",
+          path_is_exposed("/wp-admin/install.php", 200,
+                          "<title>Just a moment...</title>", None, 200), False)
+    check("an empty .env is still reported",
+          path_is_exposed("/.env", 200, "", None, 200), True)
+    check("an empty 200 gets the verdict 'empty'",
+          path_verdict("/.env", 200, "", True), "empty")
+    check("a timeout is 'no answer', never 'not readable'",
+          path_verdict("/.env", 0, "", False), "no answer")
+
+    # 21. The installer needs a positive marker; the mere absence of
+    #     "Already Installed" is not evidence.
+    check("the language chooser is an open installer",
+          path_is_exposed("/wp-admin/install.php", 200,
+                          "<select name='language' id='language-chooser'>",
+                          None, 200), True)
+
+    # 22. Edge identification and challenge pages.
+    edge = edge_identity({"cf-ray": "abc", "server": "cloudflare",
+                          "x-kinsta-cache": "HIT"}, "<title>Just a moment...</title>")
+    check("edge names both layers", edge["edge"], ["Cloudflare", "Kinsta"])
+    check("a challenge body is recognised", edge["challenged"], True)
+    check("an ordinary body is not",
+          edge_identity({"server": "nginx"}, "<h1>Hello</h1>")["challenged"], False)
+
+    # 23. The REST index is bigger than a page and must not be read with the
+    #     page cap. A truncated body sets _truncated so the caller can tell
+    #     "cut off" from "not JSON".
+    try:
+        big = json.dumps({"routes": {f"/x/v1/r{i}": {} for i in range(30000)},
+                          "namespaces": ["x/v1"]})
+
+        class _Resp:
+            status = 200
+            headers = email.message.Message()
+
+            def __init__(self, data):
+                self._d = data
+
+            def read(self, n):
+                return self._d[:n]
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+        real_open = urllib.request.urlopen
+        urllib.request.urlopen = lambda req, timeout=0: _Resp(big.encode())
+        real_delay = globals()["REQUEST_DELAY"]
+        globals()["REQUEST_DELAY"] = 0
+        st, hd, body = fetch("https://example.test/wp-json/")
+        check("a body at the page cap is flagged truncated",
+              bool(hd.get("_truncated")), True)
+        st, hd, body = fetch("https://example.test/wp-json/",
+                             max_bytes=REST_INDEX_MAX_BYTES)
+        check("the REST cap reads the whole index",
+              json.loads(body)["namespaces"], ["x/v1"])
+    finally:
+        urllib.request.urlopen = real_open
+        globals()["REQUEST_DELAY"] = real_delay
+
+    # 24. A plugin that ships assets under several version strings on the
+    #     SAME page is not a caching problem. Only pages that disagree with
+    #     each other are.
+    fake_assets = {"plugins": {"lib": {"versions": ["1.0", "2.0"], "pages": 2},
+                               "cached": {"versions": ["3.0", "3.1"], "pages": 2}},
+                   "pages": [{"url": "a", "cache": "", "plugins": ["lib 1.0", "lib 2.0", "cached 3.0"]},
+                             {"url": "b", "cache": "", "plugins": ["lib 1.0", "lib 2.0", "cached 3.1"]}]}
+
+    class _Ctx:
+        def data(self, key):
+            return fake_assets
+    mixed = [f for f in check_assets(_Ctx()) if f.fid == "assets-mixed"]
+    check("only the page-disagreeing plugin is reported as mixed",
+          [e["Plugin"] for e in mixed[0].evidence] if mixed else [], ["cached"])
+
+    # 25. A robots.txt Disallow list yields probe rows, minus wildcards,
+    #     core directories and the default /wp-admin/ line.
+    rows = _robots_probe_rows(["/wp-admin/", "/private/", "/*.pdf$", "/exports/",
+                               "/wp-includes/", "https://x/"])
+    check("robots rows keep only concrete non-core paths",
+          [r[0] for r in rows], ["/private/", "/exports/"])
+
+    # 26. Site-named backups derive from the host, not a static list.
+    names = [p for p, _, _ in _site_named_backups("https://www.example.com")]
+    check("site-named backups include the bare domain and stem",
+          "/example.com.zip" in names and "/example.sql" in names, True)
+
+    # 27. readme.txt Stable tag parsing rejects "trunk" and non-versions.
+    real_fetch2 = globals()["fetch"]
+    try:
+        globals()["fetch"] = lambda *a, **k: (200, {}, "=== X ===\nStable tag: 4.2.1\n")
+        check("stable tag is read", _readme_stable_tag("https://x", "p"), "4.2.1")
+        globals()["fetch"] = lambda *a, **k: (200, {}, "Stable tag: trunk\n")
+        check("trunk is not a version", _readme_stable_tag("https://x", "p"), "")
+        globals()["fetch"] = lambda *a, **k: (200, {}, "<html>soft 404</html>")
+        check("an HTML body is not a readme", _readme_stable_tag("https://x", "p"), "")
+        globals()["fetch"] = lambda *a, **k: (200, {}, "/*\nTheme Name: Foo\nTemplate: bar\nVersion: 1.2.3\n*/")
+        style = _theme_style("https://x", "foo")
+        check("theme style.css yields version and parent",
+              (style["version"], style["parent"]), ("1.2.3", "bar"))
+    finally:
+        globals()["fetch"] = real_fetch2
 
     if failures:
         print("selftest FAILED:")
@@ -3483,19 +4614,48 @@ def normalise_site(raw: str) -> Tuple[str, str]:
         raise ValueError(f"unsupported scheme: {parsed.scheme}://")
     if not parsed.netloc:
         raise ValueError(f"could not read a hostname from {raw!r}")
-    if parsed.scheme == "http":
-        status, hdrs = fetch_no_redirect(site + "/")
-        location = hdrs.get("location", "")
-        if 300 <= status < 400 and location.startswith("https://"):
-            site = "https://" + parsed.netloc
-            note = ("the site was given as http:// but redirects to HTTPS, "
-                    "so https:// was audited instead. Auditing the http:// "
-                    "address would have reported every path as absent, "
-                    "because on a redirecting host a real file and a missing "
-                    "one answer identically.")
+
+    # Where does the root actually live? Three shapes matter. http:// to
+    # https:// on the same host is upgraded. example.com to www.example.com
+    # (or back) is adopted: every unknown path on the bare host 301s to www,
+    # so probing the bare host would classify every real file as missing.
+    # A redirect to a DIFFERENT host is refused: one run audited a host whose
+    # every path 301'd to another site's /blogs/ section, and the report
+    # described that other site's homepage as this host's wp-cron.php.
+    status, hdrs = fetch_no_redirect(site + "/")
+    location = hdrs.get("location", "")
+    if 300 <= status < 400 and location:
+        target = urllib.parse.urlparse(urllib.parse.urljoin(site + "/", location))
+        here = parsed.netloc.lower()
+        there = target.netloc.lower()
+        bare = here[4:] if here.startswith("www.") else here
+        www_pair = there in (bare, "www." + bare) and there != here
+        if target.scheme not in ("http", "https") or not there:
+            pass
+        elif there == here:
+            if target.scheme == "https" and parsed.scheme == "http":
+                site = "https://" + parsed.netloc
+                note = ("the site was given as http:// but redirects to "
+                        "HTTPS, so https:// was audited instead. Auditing the "
+                        "http:// address would have reported every path as "
+                        "absent, because on a redirecting host a real file "
+                        "and a missing one answer identically.")
+        elif www_pair and target.path in ("", "/"):
+            site = f"{target.scheme}://{target.netloc}"
+            note = (f"{parsed.netloc} redirects to {target.netloc}, so that "
+                    "host was audited instead; on the host given, every path "
+                    "redirects and a real file cannot be told from a missing "
+                    "one.")
         else:
-            note = ("audited over plain HTTP as given; this is almost "
-                    "certainly not what you want")
+            raise ValueError(
+                f"{site}/ redirects to {location}. This tool audits one host "
+                "at its root and that is a different site, so it cannot say "
+                "anything true about the address given. Run it against "
+                f"{target.scheme}://{target.netloc} instead if that is the "
+                "site you mean.")
+    if site.startswith("http://"):
+        note = note or ("audited over plain HTTP as given; this is almost "
+                        "certainly not what you want")
     return site, note
 
 

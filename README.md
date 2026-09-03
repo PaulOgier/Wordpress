@@ -82,16 +82,25 @@ Ten modules. `--list` prints this with descriptions.
 | Key | Area |
 |---|---|
 | `calibration` | How the site answers a path that cannot exist, plus a control proving the result still lets real files through |
-| `headers` | Security response headers, version disclosure, cookie flags, theme |
-| `paths` | 42 backup archives, database dumps, credential files, logs and directory listings |
-| `rest` | `/wp-json/` plugin inventory and any route accepting a write method |
+| `headers` | Whether this is WordPress at all, what sits in front of it (CDN, WAF, managed host), security response headers, cookie flags, mixed content, the core version from three independent sources, the theme and its version from `style.css` |
+| `paths` | Fifty-odd backup archives, database dumps, credential files, logs, developer artefacts, form-upload directories and directory listings, plus backup names derived from the site's own domain and the paths its `robots.txt` asks crawlers to avoid |
+| `rest` | `/wp-json/` (or `/?rest_route=/` where pretty permalinks are off) plugin inventory, any route accepting a write method, and `readme.txt` versions for plugins known only from their namespace |
 | `users` | The four routes that publish account names |
 | `media` | The whole media library, walked and reconciled against the reported total |
 | `documents` | Each document resolved, filenames triaged |
-| `assets` | Plugin versions from cache-busted asset URLs across the sitemap |
+| `assets` | Plugin versions from cache-busted asset URLs across the sitemap, cross-checked against each plugin's `readme.txt` |
 | `vulns` | Every detected plugin, theme and core version looked up for currency, withdrawal from the directory and published CVEs |
 | `transport` | HTTP-to-HTTPS, TLS, CORS, XML-RPC, `wp-cron.php`, `security.txt` |
-| `dns` | SPF and DMARC for the website domain |
+| `dns` | SPF and DMARC for the website domain, including the DMARC policy a subdomain inherits |
+
+The WordPress-specific modules (`rest`, `users`, `media`, `documents`,
+`assets`, `vulns`) are marked **not applicable** rather than run when no
+WordPress marker is found, and the report says so in its first line. The
+platform-neutral checks still run on any site: headers, cookies, mixed
+content, TLS, HTTP redirect, CORS, mail DNS, `security.txt`, and the generic
+half of the path list (`.env`, `.git`, backups, `phpinfo.php` and the rest).
+What it does not do on any site is send a payload, so cross-site scripting,
+injection and anything behind a login are out of scope by design.
 
 ### The things it gets right that a naive check does not
 
@@ -210,20 +219,33 @@ exist in the wild and both make the whole calibration useless.
 
 Then it runs a **positive control**. It requests `/robots.txt`, a file that
 exists on essentially every site, and confirms that the same filtering still
-classifies it as present. Without this, a calibration that suppressed
+classifies it as present. A site with no `robots.txt` gets two more tries,
+core jQuery and `wp-login.php`, and if none of them answers the report says
+the control could not run. Without this, a calibration that suppressed
 everything would produce an empty report that reads as a clean result. The
-report states the outcome of the control either way.
+report states the outcome of the control either way, including "not run".
+
+Where a file has a known shape, the body has to have it. A 200 at
+`/backup.sql` with no SQL in it, or at `/wp-admin/install.php` with a bot
+challenge instead of the install form, is recorded as "answered, unexpected
+content" and never as readable. A 200 with an empty body is reported, but as
+its own INFO finding rather than in the severity table: nothing was read.
 
 If the site's not-found answer cannot be pinned down, path findings are
 reported as **unverified** with instructions for a human to settle them, rather
 than reported as real or silently dropped. Both of those are ways of lying
 about what was measured.
 
-One related trap has its own guard. Passing an `http://` address for a site
-that redirects to HTTPS is catastrophic and silent: every real file 301s
-exactly like a missing one, all of them are discarded, and the run exits 0
-saying nothing is reachable. The scheme is upgraded at startup and the report
-says it happened.
+Two related traps have their own guard at startup. Passing an `http://`
+address for a site that redirects to HTTPS is catastrophic and silent: every
+real file 301s exactly like a missing one, all of them are discarded, and the
+run exits 0 saying nothing is reachable. The scheme is upgraded and the
+report says it happened. The same applies to `example.com` when the site
+lives at `www.example.com`; the `www` host is adopted and the report says
+so. A root that redirects to a different host altogether is refused with a
+message naming the host to run against, because one run audited a
+redirect-only hostname and described another site's homepage as its
+`wp-cron.php`.
 
 ## Severity
 
@@ -319,9 +341,18 @@ sitemap pages).
 
 ## Things the report states rather than hides
 
-- Which modules did not run, and why.
+- Which modules did not run, and why, including "not applicable" when the
+  site is not WordPress.
+- What sits in front of the site (Cloudflare, Sucuri, Akamai, CloudFront,
+  Kinsta, WP Engine and others), since a 403 may be the edge and a version
+  read through a cache may lag.
 - Every path that was checked, including the ones that came back clean, so
-  "checked and clean" can be told from "not checked".
+  "checked and clean" can be told from "not checked"; a probe that got no
+  answer or was rate-limited is marked as such, never as clean.
+- The core version from each source that disclosed it (generator tag, the
+  same tag on a cache-busted request, the feed, `wp-includes` asset URLs),
+  and whether they agree. A core vulnerability finding keeps its CVSS
+  severity only when two sources agree; otherwise it is capped and says why.
 - How the site answers a path that cannot exist, and whether the control proved
   the calibration still lets real files through.
 - Whether the media walk reached the whole library, and by how much it fell
@@ -342,14 +373,16 @@ sitemap pages).
 python3 wp_audit.py --selftest
 ```
 
-Forty-odd assertions against synthetic responses, no network. They cover the
+Seventy-odd assertions against synthetic responses, no network. They cover the
 shapes that have each produced a wrong report: the redirecting site, the soft
 404 that echoes the requested path, the unstable 404 that cannot be
-calibrated, the installer that answers on every site, the empty directory, the
-real but empty file, the HTML escaping of evidence rows, version ordering
-across 1.9 and 1.10, every vulnerability-range operator the feed actually
-uses, and the vulnerability record whose "no data" must not read as "no
-vulnerabilities".
+calibrated, the installer that answers on every site, the WAF challenge page
+served with a 200, the empty directory, the real but empty file, the response
+that sets several cookies, the REST index larger than a page, the plugin that
+ships its own assets under several version strings, the HTML escaping of
+evidence rows, version ordering across 1.9 and 1.10, every vulnerability-range
+operator the feed actually uses, and the vulnerability record whose "no data"
+must not read as "no vulnerabilities".
 
 They prove the decision logic, not the network behaviour. A response shape none
 of them models is a real gap, and the useful contribution is a new assertion
