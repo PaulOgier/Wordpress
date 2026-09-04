@@ -71,6 +71,14 @@ Unauthorised scanning of third-party systems is illegal in most jurisdictions.
 Real penetration testing needs written authorisation from the site owner *and*
 the host.
 
+**This tool exists to lock sites down, not to break into them.** It is
+published so that the person responsible for a site can see what an outsider
+sees and fix it. If a run turns up a real exposure on a site that is not
+yours, the right thing to do is tell the site, plainly and privately, what
+you found and where: a `security.txt` address if they publish one, otherwise
+the site's own contact page. Tell them soon, and do not download or publish
+what you found while you wait for a reply.
+
 One deliberate omission: where an endpoint accepts POST and its authentication
 is unknown, the tool reports the endpoint and says the authentication is
 unknown. It does not find out. Finding out means submitting.
