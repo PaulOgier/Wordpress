@@ -215,7 +215,7 @@ from typing import Dict, List, Optional, Tuple
 # CONFIGURATION
 ###############################################################################
 
-SCRIPT_VERSION = "1.2.0"
+SCRIPT_VERSION = "1.2.1"
 
 # [OPTIONAL] Startup check against the remote VERSION file. Fail-silent.
 CHECK_FOR_UPDATES = True
@@ -4112,7 +4112,7 @@ def _coverage_block(ctx: RunContext) -> str:
 
 def _checks_block() -> str:
     rows = "".join(
-        f"<tr><td><code>{escape(m['key'])}</code></td>"
+        f"<tr><td style='white-space:nowrap'><code>{escape(m['key'])}</code></td>"
         f"<td>{escape(m['title'])}</td><td>{escape(m['about'])}</td></tr>"
         for m in MODULES)
     return (f"<p>Every module this tool runs, whether or not it produced a "
@@ -4190,8 +4190,10 @@ REPORT_CSS = """
     body { background: #fff; }
     nav.toc { display: none; }
     .layout { display: block; max-width: none; padding: 0; }
-    section.card, .tile { box-shadow: none; border: 1px solid #ccc;
-                          page-break-inside: avoid; }
+    section.card, .tile { box-shadow: none; border: 1px solid #ccc; }
+    .tile, tr { page-break-inside: avoid; }
+    h2, h3 { page-break-after: avoid; }
+    .scroll { overflow: visible; }
     a { color: #222; text-decoration: none; }
   }
 """
