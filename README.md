@@ -1,5 +1,7 @@
 # WordPress Exposure Audit
 
+!!! This tool exists to lock sites down, not to break into them. It is published so that the person responsible for a site can see what an outsider sees and fix it. If a run turns up a real exposure on a site that is not yours, the right thing to do is tell the site, plainly and privately, what you found and where: a security.txt address if they publish one, otherwise the site's own contact page. Tell them soon, and do not download or publish what you found while you wait for a reply.
+
 `wp_audit.py` checks a WordPress site from the outside and writes a
 self-contained HTML report you can hand to whoever owns the site.
 
