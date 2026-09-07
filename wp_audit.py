@@ -944,10 +944,11 @@ def running_version(versions: List[str]) -> str:
     A `ver=` in an asset URL belongs to the FILE, not to the plugin: bundled
     libraries and hand-written enqueues carry their own numbers, and a
     hardcoded ver=1.0.0 on one script is common. Taking the lowest of them
-    reported wpbeginner.com's WPForms 2.0.0.2 as 1.0.0, matched a "< 1.7.7"
-    advisory and published a CVSS 9.8 that was not there. The highest is the
-    only one that cannot be a stale constant left inside an older file, so it
-    is what the report measures. Lower ones stay in detected_versions.
+    read a current plugin as its oldest bundled file, matched an advisory
+    covering everything below a long-fixed release, and published a CVSS 9.8
+    that was not there. The highest is the only one that cannot be a stale
+    constant left inside an older file, so it is what the report measures.
+    Lower ones stay in detected_versions.
     """
     ordered = [v for v in versions if version_ordered(v)]
     return max(ordered, key=version_key) if ordered else ""
@@ -4995,14 +4996,14 @@ def selftest() -> int:
           [])
 
     # 30. The version a component is running is the highest one seen, not the
-    #     lowest. wpbeginner.com's WPForms published 1.0.0, 1.1.2, 1.21.0 and
-    #     2.0.0.2 across its own scripts on one page; measuring from 1.0.0
-    #     matched a "< 1.7.7" record and printed a CVSS 9.8 for a plugin on
-    #     2.0.0.2. kinsta.com's WordLift was called seven releases behind
-    #     while its assets ran ahead of the directory's current release.
-    wpforms = ["1.0.0", "1.1.2", "1.21.0", "2.0.0.2"]
+    #     lowest. A live plugin published four versions across its own scripts
+    #     on one page; measuring from the lowest matched a record covering
+    #     everything below a long-fixed release and printed a CVSS 9.8 for a
+    #     plugin that was current. The same reading called a second plugin
+    #     seven releases behind while its assets ran ahead of the directory.
+    spread = ["1.0.0", "1.1.2", "1.21.0", "2.0.0.2"]
     check("the running version is the highest seen",
-          running_version(wpforms), "2.0.0.2")
+          running_version(spread), "2.0.0.2")
     check("an unorderable string does not become the version",
           running_version(["latest", "1.4"]), "1.4")
     check("no ordered version yields nothing", running_version(["latest"]), "")
@@ -5012,13 +5013,13 @@ def selftest() -> int:
         {"name": "real", "operator": {"max_version": "2.0.0.3", "max_operator": "lt"},
          "impact": {"cvss": {"score": "5.3"}}, "source": []},
     ]}
-    hit, _ = _vuln_rows(ranges, running_version(wpforms))
+    hit, _ = _vuln_rows(ranges, running_version(spread))
     check("a stale ver= on one file does not match an old advisory",
           [r["name"] for r in hit], ["real"])
     real_fetch3 = fetch
     try:
         globals()["fetch"] = lambda *a, **k: (200, {}, json.dumps({
-            "slug": "wordlift", "name": "WordLift", "version": "3.54.15",
+            "slug": "example-plugin", "name": "Example", "version": "3.54.15",
             "versions": {"3.54.6": "", "3.54.15": ""}}))
         ahead = _currency("https://example.test", ["3.55.1-0", "3.54.6"])
         check("assets ahead of the directory are not behind it",
