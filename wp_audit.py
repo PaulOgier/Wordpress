@@ -215,7 +215,7 @@ from typing import Dict, List, Optional, Tuple
 # CONFIGURATION
 ###############################################################################
 
-SCRIPT_VERSION = "1.3.0"
+SCRIPT_VERSION = "1.3.1"
 
 # [OPTIONAL] Startup check against the remote VERSION file. Fail-silent.
 CHECK_FOR_UPDATES = True
@@ -3886,9 +3886,11 @@ def check_dns(ctx: RunContext) -> List[Finding]:
             "If the domain sends no mail, publish a hard-fail record: "
             "v=spf1 -all. If it does, list the senders and end with ~all "
             "until the reports are clean.",
-            [{"Domain": domain, "SPF": "absent"}]
-            + ([{"Note": f"rated low because {parent}'s DMARC policy "
-                         f"({parent_policy}) already covers this subdomain"}]
+            [{"Record": "Domain", "Value": domain},
+             {"Record": "SPF", "Value": "absent"}]
+            + ([{"Record": "Note",
+                 "Value": f"rated low because {parent}'s DMARC policy "
+                          f"({parent_policy}) already covers this subdomain"}]
                if inherits_enforcing else []), "dns.json"))
     # An SPF record naming no sender at all says "nothing may send as this
     # domain". That is the right record for a domain that sends no mail, and
@@ -3923,8 +3925,10 @@ def check_dns(ctx: RunContext) -> List[Finding]:
             "Workspace tenant that is include:_spf.google.com) and check the "
             "DMARC reports the domain is already collecting before assuming "
             "delivery has been fine all along.",
-            [{"SPF": spf}, {"MX": ", ".join(mx)},
-             {"DMARC": data.get("dmarc") or "absent"}], "dns.json"))
+            [{"Record": "SPF", "Value": spf},
+             {"Record": "MX", "Value": ", ".join(mx)},
+             {"Record": "DMARC",
+              "Value": data.get("dmarc") or "absent"}], "dns.json"))
     if not data.get("dmarc") and not data.get("dmarc_delegated_to") and parent:
         findings.append(Finding(
             "dns-dmarc-inherited", "INFO" if inherits_enforcing else "LOW",
@@ -4337,7 +4341,7 @@ REPORT_CSS = """
   .label { font-weight: 700; color: #35485c; }
   table { border-collapse: collapse; width: 100%; font-size: 13px; }
   th, td { text-align: left; padding: 7px 10px; vertical-align: top;
-           border-bottom: 1px solid #e4e7ea; }
+           border-bottom: 1px solid #e4e7ea; overflow-wrap: break-word; }
   th { background: #f0f2f4; font-weight: 600; }
   table.kv th { width: 34%; background: #fafbfc; }
   .scroll { overflow-x: auto; margin: 12px 0 4px; }
