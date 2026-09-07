@@ -215,7 +215,7 @@ from typing import Dict, List, Optional, Tuple
 # CONFIGURATION
 ###############################################################################
 
-SCRIPT_VERSION = "1.2.1"
+SCRIPT_VERSION = "1.3.0"
 
 # [OPTIONAL] Startup check against the remote VERSION file. Fail-silent.
 CHECK_FOR_UPDATES = True
@@ -1388,20 +1388,32 @@ def path_verdict(path: str, status: int, body: str, exposed: bool,
     return "not readable"
 
 
-def _readme_stable_tag(site: str, slug: str) -> str:
-    """The Stable tag from a plugin's own readme.txt, or "".
+def _readme_probe(site: str, slug: str) -> Tuple[str, int]:
+    """The Stable tag from a plugin's own readme.txt, and the HTTP status.
 
     Independent of the page cache and of asset URLs, so it cross-checks the
     version read from ?ver= and supplies one where no asset carried it. It is
     a second witness, not the authority: authors forget to bump it, and
     "trunk" is a legal value. Both are rejected here.
+
+    The status is returned because an empty tag has two very different
+    causes. A WAF that answers every /wp-content/plugins/*/readme.txt with
+    403 means no version could be read for ANY plugin, which is a fact about
+    the edge and not about the plugins. Reporting that as "no version could
+    be read" invites the reader to go looking on the Plugins screen for
+    something that was never observable from outside.
     """
     status, _, body = fetch(f"{site}/wp-content/plugins/{slug}/readme.txt",
                             max_bytes=65_536)
     if status != 200 or "<html" in body[:2000].lower():
-        return ""
+        return "", status
     match = re.search(r"(?im)^\s*stable tag:\s*([0-9][0-9a-zA-Z.\-]*)\s*$", body)
-    return match.group(1).strip() if match else ""
+    return (match.group(1).strip() if match else ""), status
+
+
+def _readme_stable_tag(site: str, slug: str) -> str:
+    """The Stable tag alone. See _readme_probe for the status."""
+    return _readme_probe(site, slug)[0]
 
 
 def _theme_style(site: str, slug: str) -> Dict:
@@ -1861,9 +1873,10 @@ def collect_rest(ctx: RunContext) -> Tuple[str, int, str]:
         name, slug = NAMESPACE_PLUGINS.get(ns, (ns, None))
         if not slug or slug in namespace_plugins:
             continue
-        tag = _readme_stable_tag(ctx.site, slug)
+        tag, readme_status = _readme_probe(ctx.site, slug)
         namespace_plugins[slug] = {"name": name, "namespace": ns,
-                                   "readme_version": tag}
+                                   "readme_version": tag,
+                                   "readme_status": readme_status}
     ctx.write("rest", {
         "name": data.get("name", ""),
         "description": data.get("description", ""),
@@ -2152,8 +2165,9 @@ def collect_assets(ctx: RunContext) -> Tuple[str, int, str]:
     for slug, entry in plugins.items():
         if shutdown_requested:
             break
-        tag = _readme_stable_tag(ctx.site, slug)
+        tag, readme_status = _readme_probe(ctx.site, slug)
         entry["readme_version"] = tag
+        entry["readme_status"] = readme_status
         if tag and not entry["versions"]:
             entry["versions"][tag] = 0
     data = {
@@ -2164,6 +2178,7 @@ def collect_assets(ctx: RunContext) -> Tuple[str, int, str]:
         "plugins": {slug: {
             "versions": sorted(v["versions"]),
             "readme_version": v.get("readme_version", ""),
+            "readme_status": v.get("readme_status", 0),
             "pages": v["pages"],
         } for slug, v in sorted(plugins.items())},
         "pages": page_rows,
@@ -2250,7 +2265,9 @@ def collect_vulns(ctx: RunContext) -> Tuple[str, int, str]:
             continue
         tag = info.get("readme_version", "")
         plugins[slug] = {"versions": [tag] if tag else [], "pages": 0,
-                         "readme_version": tag, "source": "rest namespace"}
+                         "readme_version": tag,
+                         "readme_status": info.get("readme_status", 0),
+                         "source": "rest namespace"}
     theme_slugs = headers.get("theme", []) or []
     theme_info = headers.get("theme_info", {}) or {}
 
@@ -2315,6 +2332,7 @@ def collect_vulns(ctx: RunContext) -> Tuple[str, int, str]:
         versions = [v for v in info.get("versions", []) if version_ordered(v)]
         entry: Dict = {"detected_versions": info.get("versions", []),
                        "readme_version": info.get("readme_version", ""),
+                       "readme_status": info.get("readme_status", 0),
                        "source": info.get("source", "assets"),
                        "pages": info.get("pages", 0)}
         # readme.txt disagreeing with the asset URLs means one of them is
@@ -2651,8 +2669,10 @@ MODULES: List[Dict] = [
               "security.txt."},
     {"key": "dns", "title": "Mail spoofing posture",
      "fn": collect_dns, "required": False,
-     "about": "SPF and DMARC for the website domain, which is the half "
-              "nobody owns when it differs from the mail domain."},
+     "about": "SPF, DMARC and MX for the website domain, which is the half "
+              "nobody owns when it differs from the mail domain. The MX "
+              "records are read to tell a domain that sends no mail from one "
+              "whose SPF record forgot its senders."},
 ]
 
 MODULE_BY_KEY = {m["key"]: m for m in MODULES}
@@ -2959,16 +2979,36 @@ def check_headers(ctx: RunContext) -> List[Finding]:
     generators = data.get("generators", [])
     wp_version = next((g for g in generators if g.lower().startswith("wordpress")), "")
     if wp_version:
+        # The generator list is read from the first homepage fetch, which a
+        # CDN can serve from cache. The cache-busted read and the feed are
+        # written by WordPress on the spot, so they win the headline; a
+        # report that leads with a stale number gets its other numbers
+        # doubted too.
+        sources = data.get("core_versions") or {}
+        live = next((sources[k] for k in ("generator (cache-busted)", "feed")
+                     if sources.get(k)), "")
+        cached = sources.get("generator", "")
+        stale = bool(live and cached and live != cached)
+        headline = f"WordPress {live}" if live else wp_version
+        rows = [{"Generator": g} for g in generators]
+        if stale:
+            rows.insert(0, {"Generator": f"WordPress {live} (read live, "
+                                         "cache defeated)"})
         findings.append(Finding(
             "headers-generator", "INFO",
-            f"The site publishes its WordPress version: {wp_version}",
+            f"The site publishes its WordPress version: {headline}",
             "WordPress adds a generator meta tag to every page unless it is "
             "removed. It saves an attacker the trouble of working out which "
-            "core version they are looking at.",
+            "core version they are looking at."
+            + (f" The cached homepage still says {cached}; the version above "
+               "was read with the cache defeated and is what the site is "
+               "serving now. The gap is a cache that has not caught up, not "
+               "two versions of WordPress."
+               if stale else ""),
             "Remove it with a one-line filter "
             "(remove_action('wp_head', 'wp_generator')). Keeping the site "
             "patched matters far more than hiding the number.",
-            [{"Generator": g} for g in generators], "headers.json"))
+            rows, "headers.json"))
     return findings
 
 
@@ -3243,21 +3283,61 @@ def check_rest(ctx: RunContext) -> List[Finding]:
             f"{len(rpc)} route(s) accept write methods and look like a "
             "remote-control interface",
             "These routes advertise POST, PUT or DELETE and sit in a "
-            "namespace that exists to drive the site programmatically. "
-            "Whether they accept an anonymous call is UNKNOWN and was "
-            "deliberately not tested, because finding out means sending a "
-            "POST, which is submitting rather than observing. Most WordPress "
-            "routes require authentication for writes, which is why this is "
-            "rated medium on the evidence of a name; an unauthenticated route "
-            "of this shape would be a way to change the site, so resolve it "
-            "rather than filing it.",
-            "Determine from the plugin's own documentation or its source "
-            "what authentication these routes require. If the plugin is not "
-            "in use, remove it rather than deactivating it. If it is, "
-            "restrict the routes to authenticated callers and confirm from "
-            "the plugin's settings that no long-lived token is issued.",
+            "namespace that exists to drive the site programmatically. They "
+            "are singled out from the "
+            f"{len(data.get('write_routes', []))} routes on this site that "
+            "accept a write method: the rest belong to ordinary plugins "
+            "writing their own settings, while these exist to let something "
+            "outside the site operate it. Whether they accept an anonymous "
+            "call is UNKNOWN and was deliberately not tested, because "
+            "finding out means sending a POST, which is submitting rather "
+            "than observing. Most WordPress routes require authentication "
+            "for writes, which is why this is rated medium on the evidence "
+            "of a name; an unauthenticated route of this shape would be a "
+            "way to change the site, so resolve it rather than filing it.",
+            "First question, before any of the technical ones: did anyone "
+            "mean to install this, and is it still being used for something? "
+            "An interface for driving the site remotely that nobody "
+            "remembers switching on is worth removing outright. If it is in "
+            "use, determine from the plugin's own documentation or its "
+            "source what authentication these routes require, restrict them "
+            "to authenticated callers, and confirm from the plugin's "
+            "settings that no long-lived token has been issued. Removing "
+            "beats deactivating: a deactivated plugin's files stay on disk.",
             [{"Route": r["route"], "Methods": ", ".join(r["methods"])}
              for r in rpc], "rest.json", len(rpc)))
+
+    # Application passwords. The REST index advertises them when they are
+    # available, which is the WordPress default over HTTPS. On its own that
+    # is unremarkable; next to an enumerable user list it is the other half
+    # of a credential, so the report names it rather than leaving it in the
+    # JSON for nobody to read.
+    auth = (data.get("authentication") or {}).get("application-passwords") or {}
+    if auth:
+        users = ctx.data("users") or {}
+        published = len(users.get("rest", []) or [])
+        findings.append(Finding(
+            "rest-app-passwords", "LOW" if published else "INFO",
+            "Application passwords are enabled, which is the WordPress default",
+            "An application password is a second credential on a real "
+            "account: it is created in wp-admin, it carries that account's "
+            "full permissions, it bypasses two-factor authentication by "
+            "design, and it does not expire. That is what makes it useful "
+            "for connecting other software, and it is also why it is worth "
+            "an inventory."
+            + (f" This site also publishes {published} usernames, so an "
+               "attacker needs only the password half."
+               if published else ""),
+            "In wp-admin, open each administrator's profile and read the "
+            "Application Passwords section: every entry there is a live "
+            "credential, and 'Last used' says whether anything still needs "
+            "it. Revoke the ones nothing is using. If no integration needs "
+            "them at all, turn the feature off with the "
+            "wp_is_application_passwords_available filter.",
+            [{"Setting": "application passwords", "State": "enabled",
+              "Authorisation screen": auth.get("endpoints", {}).get(
+                  "authorization", "not published")}],
+            "rest.json"))
     return findings
 
 
@@ -3427,27 +3507,59 @@ def check_vulns(ctx: RunContext) -> List[Finding]:
             "has to be deactivated and removed until one is, or replaced.",
             rows, "vulns.json", len(vulnerable)))
 
-    # 2. Withdrawn from the directory. No vulnerability database needed, and
-    #    frequently more urgent than one: a closed plugin gets no more
-    #    security releases, and closure is often itself the security event.
+    # 2. Withdrawn from the directory. No vulnerability database needed.
+    #
+    #    Two things this deliberately does NOT say, both of them corrections
+    #    to what it used to say. First, a closure is not proof of
+    #    abandonment: "Author Request" is also what a library looks like when
+    #    its author moves distribution to Composer or GitHub and keeps
+    #    shipping. Carbon Fields, closed 2019, was releasing eleven days
+    #    before the run that produced this comment. Second, a namespace is
+    #    not an installation. A slug seen only in the REST index can be a
+    #    library bundled inside a theme or another plugin, so "installed" and
+    #    "remove the plugin" are both claims the evidence does not support.
     closed = {slug: entry for slug, entry in {**plugins, **themes}.items()
               if (entry.get("wporg") or {}).get("closed")}
     if closed:
+        def _seen_as(slug: str, entry: Dict) -> str:
+            if slug in themes:
+                return "named as the active theme in the homepage HTML"
+            if entry.get("source") == "rest namespace":
+                return ("a REST namespace only, which a bundled library "
+                        "produces as readily as an installed plugin")
+            return f"asset URLs on {entry.get('pages', 0)} page(s)"
+
+        namespace_only = all(
+            slug not in themes and entry.get("source") == "rest namespace"
+            for slug, entry in closed.items())
         findings.append(Finding(
-            "vulns-closed", "HIGH",
-            f"{len(closed)} installed component(s) have been withdrawn from "
-            "the WordPress directory",
-            "WordPress.org has closed this plugin or theme, so it can no "
-            "longer be downloaded or installed. Closure is most often a "
-            "guideline breach or an abandonment, but it is also what happens "
-            "when an unfixed security issue is reported and the author does "
-            "not respond. Either way the site is running code that will never "
-            "receive another update, including a security one, and WordPress "
-            "will not warn the administrator about it.",
-            "Find out why each was closed, then replace it with a maintained "
-            "alternative or remove it. Do not leave a closed plugin installed "
-            "and deactivated: its files stay on disk and stay reachable.",
+            "vulns-closed",
+            # Direct evidence of an installed, closed plugin is a real
+            # exposure. A namespace on its own is a question, and a question
+            # does not belong in the same severity band as a finding.
+            "MEDIUM" if namespace_only else "HIGH",
+            f"{len(closed)} component(s) match a slug that wordpress.org has "
+            "withdrawn",
+            "WordPress.org has closed this slug, so nothing more will arrive "
+            "through the update screen and WordPress will not warn the "
+            "administrator about it. What the closure MEANS varies, and the "
+            "directory's stated reason is the only clue on offer: a security "
+            "report the author never answered is one cause, but so is a "
+            "developer library whose author moved distribution to Composer "
+            "or GitHub and is still shipping releases there. The second kind "
+            "is usually bundled inside a theme or another plugin rather than "
+            "installed, which is also why it can appear here without "
+            "anything showing on the Plugins screen. Read the 'How it was "
+            "seen' column before acting: where that says a REST namespace "
+            "only, this report cannot tell the two cases apart.",
+            "Start by asking the developer what this component is and where "
+            "it comes from - a bundled library needs its bundled version "
+            "checked against the author's own releases, not removal. Where "
+            "it is genuinely an installed plugin nobody maintains, replace "
+            "or remove it; do not leave it installed and deactivated, "
+            "because its files stay on disk and stay reachable.",
             [{"Component": slug,
+              "How it was seen": _seen_as(slug, entry),
               "Closed on": (entry.get("wporg") or {}).get("closed_date", "") or "unstated",
               "Stated reason": (entry.get("wporg") or {}).get("closed_reason", "")
                                or "not published"}
@@ -3492,6 +3604,10 @@ def check_vulns(ctx: RunContext) -> List[Finding]:
             continue
         stale.append({
             "Component": slug,
+            "How it was seen": ("named as the active theme" if slug in themes
+                                else "a REST namespace only"
+                                if entry.get("source") == "rest namespace"
+                                else f"asset URLs on {entry.get('pages', 0)} page(s)"),
             "Version running": ", ".join(entry.get("detected_versions", [])) or "not read",
             "Current release": wporg.get("current_version", ""),
             "Last released": (wporg.get("last_updated", "") or "")[:10],
@@ -3611,9 +3727,15 @@ def check_vulns(ctx: RunContext) -> List[Finding]:
         if not (entry.get("wporg") or {}).get("found"):
             reasons.append("not in the wordpress.org directory")
         if not entry.get("detected_versions"):
+            # A 403 on readme.txt is the edge refusing, not the plugin
+            # hiding. Said plainly, because the reader's next move differs:
+            # one is a question for the developer, the other is a WAF rule.
+            blocked = entry.get("readme_status") in (401, 403)
             reasons.append("no version could be read"
                            + (" from style.css" if slug in themes else
-                              " from asset URLs or readme.txt")
+                              (" from asset URLs, and readme.txt is blocked "
+                               f"by the edge (HTTP {entry.get('readme_status')})"
+                               if blocked else " from asset URLs or readme.txt"))
                            + ", so no range could be matched")
         if entry.get("undecidable"):
             reasons.append(f"{entry['undecidable']} record(s) used a version "
@@ -3768,6 +3890,41 @@ def check_dns(ctx: RunContext) -> List[Finding]:
             + ([{"Note": f"rated low because {parent}'s DMARC policy "
                          f"({parent_policy}) already covers this subdomain"}]
                if inherits_enforcing else []), "dns.json"))
+    # An SPF record naming no sender at all says "nothing may send as this
+    # domain". That is the right record for a domain that sends no mail, and
+    # the wrong one for a domain with a mailbox provider on its MX: every
+    # message it sends fails SPF, and under p=reject the failure is fatal
+    # unless DKIM happens to carry the alignment on its own.
+    spf = data.get("spf", "")
+    mx = data.get("mx", []) or []
+    if spf and mx and not re.search(
+            r"\b(include:|a[:\s]|mx\b|ptr\b|exists:|ip4:|ip6:|redirect=)", spf):
+        policy = re.search(r"\bp=(\w+)", data.get("dmarc", "") or "")
+        enforcing = policy and policy.group(1).lower() in ("quarantine", "reject")
+        findings.append(Finding(
+            "dns-spf-senders", "MEDIUM",
+            f"{domain} has mail servers but its SPF record authorises no sender",
+            f"The record is {spf}. It names no sender and ends in -all, which "
+            "tells every receiving server that no host on earth is allowed to "
+            "send as this domain. That is exactly right for a domain that "
+            "sends no mail. This domain has MX records, so it receives mail, "
+            "and a domain that receives mail usually sends it too. If it "
+            "does, every message it sends fails SPF"
+            + (f", and the DMARC policy on this domain is p={policy.group(1)}, "
+               "so that failure is enough to have the message rejected "
+               "outright unless DKIM signs it and aligns."
+               if enforcing else ". ")
+            + " This report cannot tell which case applies: the deliberate "
+              "one, where all mail is sent from another domain, looks "
+              "identical from outside.",
+            "Confirm where this domain's mail is actually sent from. If it "
+            "sends none, the record is correct and nothing needs doing - say "
+            "so and move on. If it sends any, add the senders (for a Google "
+            "Workspace tenant that is include:_spf.google.com) and check the "
+            "DMARC reports the domain is already collecting before assuming "
+            "delivery has been fine all along.",
+            [{"SPF": spf}, {"MX": ", ".join(mx)},
+             {"DMARC": data.get("dmarc") or "absent"}], "dns.json"))
     if not data.get("dmarc") and not data.get("dmarc_delegated_to") and parent:
         findings.append(Finding(
             "dns-dmarc-inherited", "INFO" if inherits_enforcing else "LOW",
@@ -3895,11 +4052,18 @@ def _profile_block(ctx: RunContext) -> str:
         if platform else "")
     add("In front of the site",
         ", ".join(headers.get("edge", [])) or "nothing identified")
-    add("Platform", ", ".join(headers.get("generators", []))
-        or "not published (good)")
+    # The generator list comes off the first homepage fetch, which the CDN
+    # may have served from cache. Show the live reading in the Platform row
+    # so the summary and the finding headline agree.
+    core_versions = headers.get("core_versions") or {}
+    live_core = next((core_versions[k] for k in
+                      ("generator (cache-busted)", "feed") if core_versions.get(k)), "")
+    add("Platform", ", ".join(
+        f"WordPress {live_core}"
+        if live_core and g.lower().startswith("wordpress") else g
+        for g in headers.get("generators", [])) or "not published (good)")
     add("Core version by source",
-        "; ".join(f"{k}: {v}" for k, v in
-                  (headers.get("core_versions") or {}).items()))
+        "; ".join(f"{k}: {v}" for k, v in core_versions.items()))
     theme_info = headers.get("theme_info") or {}
     add("Theme", ", ".join(
         f"{slug}"
@@ -3932,10 +4096,15 @@ def _profile_block(ctx: RunContext) -> str:
         if transport.get("xmlrpc", {}).get("answering") else "not answering")
     add("security.txt", "present"
         if transport.get("security_txt", {}).get("present") else "absent")
+    add("Application passwords",
+        "enabled (the WordPress default)"
+        if (rest.get("authentication") or {}).get("application-passwords")
+        else "not advertised by the REST index")
     add("SPF", dns.get("spf") or "absent")
     add("DMARC", dns.get("dmarc")
         or (f"delegated to {dns['dmarc_delegated_to']}"
             if dns.get("dmarc_delegated_to") else "absent"))
+    add("MX", ", ".join(dns.get("mx", [])) or "none (this domain receives no mail)")
 
     body = "".join(f"<tr><th scope='row'>{escape(k)}</th>"
                    f"<td>{escape(str(v))}</td></tr>" for k, v in rows)
@@ -4735,8 +4904,57 @@ def selftest() -> int:
         style = _theme_style("https://x", "foo")
         check("theme style.css yields version and parent",
               (style["version"], style["parent"]), ("1.2.3", "bar"))
+        globals()["fetch"] = lambda *a, **k: (403, {}, "<html>blocked</html>")
+        check("a WAF block is reported as its status, not as an absent readme",
+              _readme_probe("https://x", "p"), ("", 403))
     finally:
         globals()["fetch"] = real_fetch2
+
+    # 28. A withdrawn slug seen only as a REST namespace is a question, not a
+    #     finding. Carbon Fields, closed in 2019 at the author's request, is
+    #     still shipping on GitHub and is bundled rather than installed.
+    def _closed_ctx(source, slug="carbon-fields"):
+        vulns = {"plugins": {slug: {"source": source, "pages": 0,
+                                    "detected_versions": [], "covered": True,
+                                    "wporg": {"closed": True, "found": True,
+                                              "closed_date": "2019-02-06",
+                                              "closed_reason": "Author Request"}}},
+                 "themes": {}, "core": {}}
+
+        class _C:
+            def data(self, key):
+                return vulns if key == "vulns" else {}
+        return _C()
+
+    ns_only = [f for f in check_vulns(_closed_ctx("rest namespace"))
+               if f.fid == "vulns-closed"]
+    check("a namespace-only closure is medium, not high",
+          ns_only[0].severity if ns_only else "", "MEDIUM")
+    check("and the report says how it was seen",
+          "REST namespace" in ns_only[0].evidence[0]["How it was seen"], True)
+    installed = [f for f in check_vulns(_closed_ctx("assets"))
+                 if f.fid == "vulns-closed"]
+    check("a closure evidenced by asset URLs is still high",
+          installed[0].severity if installed else "", "HIGH")
+
+    # 29. SPF with no sender is correct for a domain that sends no mail and
+    #     wrong for one with an MX. Only the second is a finding.
+    def _dns_ctx(spf, mx):
+        class _C:
+            def data(self, key):
+                return {"domain": "x.test", "spf": spf, "mx": mx,
+                        "dmarc": "v=DMARC1;p=reject;"}
+        return _C()
+
+    check("no senders plus an MX is reported",
+          [f.fid for f in check_dns(_dns_ctx("v=spf1 -all", ["1 mx.test."]))],
+          ["dns-spf-senders"])
+    check("no senders and no MX is the correct record, and silent",
+          [f.fid for f in check_dns(_dns_ctx("v=spf1 -all", []))], [])
+    check("a record that names a sender is not reported",
+          [f.fid for f in check_dns(
+              _dns_ctx("v=spf1 include:_spf.google.com ~all", ["1 mx.test."]))],
+          [])
 
     if failures:
         print("selftest FAILED:")
