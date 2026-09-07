@@ -215,7 +215,7 @@ from typing import Dict, List, Optional, Tuple
 # CONFIGURATION
 ###############################################################################
 
-SCRIPT_VERSION = "1.3.1"
+SCRIPT_VERSION = "1.4.0"
 
 # [OPTIONAL] Startup check against the remote VERSION file. Fail-silent.
 CHECK_FOR_UPDATES = True
@@ -936,6 +936,21 @@ def version_key(version: str) -> Tuple[Tuple[int, ...], int]:
 def version_ordered(version: str) -> bool:
     """Whether version_key() could actually place this string."""
     return version_key(version)[0] != (-1,)
+
+
+def running_version(versions: List[str]) -> str:
+    """The best single estimate of the version a component is running.
+
+    A `ver=` in an asset URL belongs to the FILE, not to the plugin: bundled
+    libraries and hand-written enqueues carry their own numbers, and a
+    hardcoded ver=1.0.0 on one script is common. Taking the lowest of them
+    reported wpbeginner.com's WPForms 2.0.0.2 as 1.0.0, matched a "< 1.7.7"
+    advisory and published a CVSS 9.8 that was not there. The highest is the
+    only one that cannot be a stale constant left inside an older file, so it
+    is what the report measures. Lower ones stay in detected_versions.
+    """
+    ordered = [v for v in versions if version_ordered(v)]
+    return max(ordered, key=version_key) if ordered else ""
 
 
 def vuln_applies(version: str, operator: Dict) -> Optional[bool]:
@@ -2346,19 +2361,19 @@ def collect_vulns(ctx: RunContext) -> Tuple[str, int, str]:
         entry["covered"] = lookup["covered"]
         entry["lookup_error"] = lookup["error"]
         entry["total_records"] = len(lookup["record"].get("vulnerability") or [])
+        # Matched against the running version alone. Matching every detected
+        # version reported a vulnerability the site does not have every time a
+        # bundled script carried an old ver=.
+        entry["version_running"] = running_version(versions)
         matched: List[Dict] = []
         undecidable = 0
-        for version in versions:
-            rows, skipped = _vuln_rows(lookup["record"], version)
-            undecidable = max(undecidable, skipped)
-            for row in rows:
-                row = dict(row, affected_version=version)
-                matched.append(row)
-        # One vulnerability seen on two detected versions is one vulnerability.
-        seen = set()
-        entry["vulnerabilities"] = [
-            row for row in sorted(matched, key=lambda r: r["score"], reverse=True)
-            if not (row["name"] in seen or seen.add(row["name"]))]
+        if entry["version_running"]:
+            matched, undecidable = _vuln_rows(lookup["record"],
+                                              entry["version_running"])
+            matched = [dict(r, affected_version=entry["version_running"])
+                       for r in matched]
+        entry["vulnerabilities"] = sorted(matched, key=lambda r: r["score"],
+                                          reverse=True)
         entry["undecidable"] = undecidable
         data["plugins"][slug] = entry
 
@@ -2372,6 +2387,7 @@ def collect_vulns(ctx: RunContext) -> Tuple[str, int, str]:
         version = style.get("version", "")
         versions = [version] if version and version_ordered(version) else []
         entry = {"detected_versions": versions,
+                 "version_running": running_version(versions),
                  "theme_name": style.get("name", ""),
                  "parent": style.get("parent", ""),
                  "pages": 0,
@@ -2435,15 +2451,16 @@ def _currency(url: str, versions: List[str]) -> Dict:
     }
     all_versions = [v for v in (payload.get("versions") or {}) if version_ordered(v)]
     current["releases_published"] = len(all_versions)
-    if versions and current["current_version"]:
-        oldest = min(versions, key=version_key)
-        current["outdated"] = version_key(oldest) < version_key(current["current_version"])
+    running = running_version(versions)
+    if running and current["current_version"]:
+        current["outdated"] = (version_key(running)
+                               < version_key(current["current_version"]))
         # Only count releases when the list demonstrably reaches the current
         # release. wordpress.org returned 11 versions topping out at 1.7 for a
         # plugin then shipping 8.0.4, and counting against that list reported
         # a plugin two majors behind as perfectly current.
         if current["current_version"] in all_versions:
-            floor = version_key(oldest)
+            floor = version_key(running)
             ceiling = version_key(current["current_version"])
             # Only releases up to the current one count. The list also
             # carries betas and tags above it, which reported a plugin ON the
@@ -2649,10 +2666,13 @@ MODULES: List[Dict] = [
               "page in the sitemap, not just one."},
     {"key": "vulns", "title": "Known vulnerabilities and currency",
      "fn": collect_vulns, "required": False,
-     "about": "Looks every detected plugin, theme and core version up "
-              "against api.wordpress.org for currency and withdrawal, and "
-              "wpvulnerability.net for published CVEs. Components with no "
-              "record are reported as unchecked, never as clean."},
+     "about": "Looks each plugin, theme and core version up against "
+              "api.wordpress.org for currency and withdrawal, and "
+              "wpvulnerability.net for published CVEs. Where a component's "
+              "asset URLs carry several versions the highest is the one "
+              "measured, because the lower ones belong to individual files. "
+              "Components with no record are reported as unchecked, never "
+              "as clean."},
     # The path sweep is the one burst in a run (fifty-odd paths, two requests
     # each) and it is what trips rate limiters. It runs after the modules
     # whose data the vulnerability lookups depend on, so a WAF that starts
@@ -3463,17 +3483,27 @@ def check_vulns(ctx: RunContext) -> List[Finding]:
             matched = top.get("affected_version", "")
             readme = entry.get("readme_version", "")
             version_text = matched
+            others = [v for v in entry.get("detected_versions", [])
+                      if v != matched]
+            if others and not entry.get("version_conflict"):
+                # Say what else was on the page. A reader who greps the source
+                # and finds ver=1.0.0 needs to know it was seen and discounted.
+                version_text = (f"{matched}; asset URLs also carry "
+                                f"{', '.join(others)}, which belong to "
+                                "individual files")
             if entry.get("source") == "rest namespace":
                 version_text = f"{matched} (from the plugin's readme.txt)"
             elif entry.get("version_conflict"):
-                # Two witnesses that disagree. The match holds for one of them
-                # and the other may be current, so the component cannot carry
-                # more than MEDIUM until someone reads the Plugins screen.
+                # Two witnesses that disagree. Only the higher one was
+                # measured, so nothing here is known about the lower, and the
+                # component cannot carry more than MEDIUM until someone reads
+                # the Plugins screen.
                 other = readme if matched != readme else ", ".join(
                     v for v in entry.get("detected_versions", []) if v != readme)
-                version_text = (f"{matched} per {'readme.txt' if matched == readme else 'asset URLs'}; "
+                version_text = (f"{matched} per {'readme.txt' if matched == readme else 'asset URLs'}, "
+                                "the higher of two disagreeing sources; "
                                 f"{'asset URLs say' if matched == readme else 'readme.txt says'} "
-                                f"{other}, which does not match this range. "
+                                f"{other}, which was not measured. "
                                 "Confirm on the Plugins screen.")
                 severity = cap_severity(severity, "MEDIUM")
             if SEVERITY_ORDER.index(severity) < SEVERITY_ORDER.index(worst):
@@ -3608,7 +3638,11 @@ def check_vulns(ctx: RunContext) -> List[Finding]:
                                 else "a REST namespace only"
                                 if entry.get("source") == "rest namespace"
                                 else f"asset URLs on {entry.get('pages', 0)} page(s)"),
-            "Version running": ", ".join(entry.get("detected_versions", [])) or "not read",
+            # Derived here as well as at collect time so a run directory
+            # written by an earlier version still renders a version.
+            "Version running": (entry.get("version_running")
+                                or running_version(entry.get("detected_versions", []))
+                                or "not read"),
             "Current release": wporg.get("current_version", ""),
             "Last released": (wporg.get("last_updated", "") or "")[:10],
             "Why it is listed": "; ".join(reasons),
@@ -4959,6 +4993,41 @@ def selftest() -> int:
           [f.fid for f in check_dns(
               _dns_ctx("v=spf1 include:_spf.google.com ~all", ["1 mx.test."]))],
           [])
+
+    # 30. The version a component is running is the highest one seen, not the
+    #     lowest. wpbeginner.com's WPForms published 1.0.0, 1.1.2, 1.21.0 and
+    #     2.0.0.2 across its own scripts on one page; measuring from 1.0.0
+    #     matched a "< 1.7.7" record and printed a CVSS 9.8 for a plugin on
+    #     2.0.0.2. kinsta.com's WordLift was called seven releases behind
+    #     while its assets ran ahead of the directory's current release.
+    wpforms = ["1.0.0", "1.1.2", "1.21.0", "2.0.0.2"]
+    check("the running version is the highest seen",
+          running_version(wpforms), "2.0.0.2")
+    check("an unorderable string does not become the version",
+          running_version(["latest", "1.4"]), "1.4")
+    check("no ordered version yields nothing", running_version(["latest"]), "")
+    ranges = {"vulnerability": [
+        {"name": "old", "operator": {"max_version": "1.7.7", "max_operator": "lt"},
+         "impact": {"cvss": {"score": "9.8"}}, "source": []},
+        {"name": "real", "operator": {"max_version": "2.0.0.3", "max_operator": "lt"},
+         "impact": {"cvss": {"score": "5.3"}}, "source": []},
+    ]}
+    hit, _ = _vuln_rows(ranges, running_version(wpforms))
+    check("a stale ver= on one file does not match an old advisory",
+          [r["name"] for r in hit], ["real"])
+    real_fetch3 = fetch
+    try:
+        globals()["fetch"] = lambda *a, **k: (200, {}, json.dumps({
+            "slug": "wordlift", "name": "WordLift", "version": "3.54.15",
+            "versions": {"3.54.6": "", "3.54.15": ""}}))
+        ahead = _currency("https://example.test", ["3.55.1-0", "3.54.6"])
+        check("assets ahead of the directory are not behind it",
+              (ahead["outdated"], ahead.get("releases_behind", 0)), (False, 0))
+        behind = _currency("https://example.test", ["3.54.6"])
+        check("a genuinely old version is still counted",
+              behind["outdated"], True)
+    finally:
+        globals()["fetch"] = real_fetch3
 
     if failures:
         print("selftest FAILED:")
