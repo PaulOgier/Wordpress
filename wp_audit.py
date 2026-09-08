@@ -215,7 +215,7 @@ from typing import Dict, List, Optional, Tuple
 # CONFIGURATION
 ###############################################################################
 
-SCRIPT_VERSION = "1.4.0"
+SCRIPT_VERSION = "1.5.0"
 
 # [OPTIONAL] Startup check against the remote VERSION file. Fail-silent.
 CHECK_FOR_UPDATES = True
@@ -1043,17 +1043,54 @@ def _vuln_rows(record: Dict, version: str) -> Tuple[List[Dict], int]:
         sources = entry.get("source") or []
         cve = next((s.get("id") for s in sources
                     if str(s.get("id", "")).startswith("CVE-")), "")
+        operator = entry.get("operator") or {}
         matched.append({
             "name": entry.get("name") or "",
             "cve": cve,
             "reference": next((s.get("link") for s in sources if s.get("link")), ""),
             "score": score,
             "vector": cvss.get("vector") or "",
-            "fixed_in": (entry.get("operator") or {}).get("max_version") or "",
-            "unfixed": str((entry.get("operator") or {}).get("unfixed")) == "1",
+            "fixed_in": operator.get("max_version") or "",
+            "max_operator": (operator.get("max_operator") or "").lower(),
+            "min_version": operator.get("min_version") or "",
+            "unfixed": str(operator.get("unfixed")) == "1",
         })
     matched.sort(key=lambda row: row["score"], reverse=True)
     return matched, undecidable
+
+
+def fix_text(row: Dict) -> str:
+    """What a reader should update to, from a vulnerability row.
+
+    `max_version` is the top of the AFFECTED range, not a fix, and the two
+    only coincide when the operator is `lt`. An unfixed advisory sits at
+    `<= <the current release>` until the author ships something, so printing
+    max_version there tells the reader to update to the exact version they
+    are already running and that is still vulnerable.
+    """
+    if row.get("unfixed"):
+        return "no fix published"
+    if not row.get("fixed_in"):
+        return ""
+    if row.get("max_operator") == "lt":
+        return row["fixed_in"]
+    return f"a release later than {row['fixed_in']}"
+
+
+def _every_release_rows(record: Dict, current: str) -> List[Dict]:
+    """Vulnerabilities that cover every published release of a component.
+
+    A record with no lower bound whose upper bound still reaches the CURRENT
+    release covers whatever version is installed, so it can be matched
+    without knowing that version. This is not a corner case: an advisory with
+    no fix published sits at `<= <current release>` by definition, which is
+    exactly the situation where "we could not read the version" would
+    otherwise hide a live, unpatchable issue behind an INFO coverage note.
+    """
+    if not version_ordered(current):
+        return []
+    rows, _ = _vuln_rows(record, current)
+    return [row for row in rows if not row["min_version"]]
 
 
 def _core_rows(record: Dict) -> List[Dict]:
@@ -1079,6 +1116,9 @@ def _core_rows(record: Dict) -> List[Dict]:
             "score": score,
             "vector": cvss.get("vector") or "",
             "fixed_in": (entry.get("operator") or {}).get("max_version") or "",
+            "max_operator": ((entry.get("operator") or {}).get("max_operator")
+                             or "").lower(),
+            "min_version": (entry.get("operator") or {}).get("min_version") or "",
             "unfixed": False,
         })
     rows.sort(key=lambda row: row["score"], reverse=True)
@@ -1825,13 +1865,29 @@ def collect_rest(ctx: RunContext) -> Tuple[str, int, str]:
     what a POST endpoint accepts means submitting, which this tool does not
     do.
     """
+    # The index is cache-busted for the same reason the asset sweep is, and
+    # the consequence here is worse. A page cache that serves a stale index
+    # keeps advertising the namespace of a plugin that has just been
+    # deactivated, and there is nothing in the response to say so: measured
+    # on a live site where /wp-json/ came back x-kinsta-cache: HIT with 16
+    # namespaces and the busted URL came back BYPASS with 15. That run put a
+    # CVE against a plugin that was no longer running. It fails the other way
+    # too - a cached index taken before a plugin was installed reports a
+    # clean site - so the cache headers are recorded either way and a HIT
+    # that survives the buster is said out loud rather than swallowed.
+    bust = "nc=" + uuid.uuid4().hex[:8]
     attempts = []
     data = None
-    for base, url in (("/wp-json", ctx.site + "/wp-json/"),
-                      ("/?rest_route=", ctx.site + "/?rest_route=/")):
+    cache = ""
+    for base, url in (("/wp-json", f"{ctx.site}/wp-json/?{bust}"),
+                      ("/?rest_route=", f"{ctx.site}/?rest_route=/&{bust}")):
         status, hdrs, data = fetch_json(url, max_bytes=REST_INDEX_MAX_BYTES)
+        cache = (hdrs.get("x-kinsta-cache") or hdrs.get("x-cache")
+                 or hdrs.get("cf-cache-status") or hdrs.get("x-litespeed-cache")
+                 or "")
         attempts.append({"base": base, "status": status,
                          "truncated": bool(hdrs.get("_truncated")),
+                         "cache": cache,
                          "json": isinstance(data, dict)})
         if isinstance(data, dict) and "routes" in data:
             ctx.manifest["meta"]["rest_base"] = base
@@ -1899,6 +1955,8 @@ def collect_rest(ctx: RunContext) -> Tuple[str, int, str]:
         "home": data.get("home", ""),
         "base": ctx.manifest["meta"].get("rest_base", "/wp-json"),
         "attempts": attempts,
+        "cache": cache,
+        "cache_hit": "hit" in cache.lower(),
         "route_count": len(routes),
         "namespaces": namespaces,
         "third_party": third_party,
@@ -1906,10 +1964,14 @@ def collect_rest(ctx: RunContext) -> Tuple[str, int, str]:
         "write_routes": write_routes,
         "authentication": data.get("authentication", {}),
     })
-    note = ""
+    notes = []
     if ctx.manifest["meta"].get("rest_base") != "/wp-json":
-        note = "read via /?rest_route=/ because /wp-json/ did not answer"
-    return "ok", len(routes), note
+        notes.append("read via /?rest_route=/ because /wp-json/ did not answer")
+    if "hit" in cache.lower():
+        notes.append(f"the edge served this from cache ({cache}) despite the "
+                     "cache-buster, so the plugin inventory below may be a "
+                     "snapshot rather than the site as it stands now")
+    return "ok", len(routes), "; ".join(notes)
 
 
 def collect_users(ctx: RunContext) -> Tuple[str, int, str]:
@@ -2373,6 +2435,16 @@ def collect_vulns(ctx: RunContext) -> Tuple[str, int, str]:
                                               entry["version_running"])
             matched = [dict(r, affected_version=entry["version_running"])
                        for r in matched]
+        else:
+            # No version was read, but a record with no lower bound that still
+            # covers the current release covers every release, so the missing
+            # version does not make it unknowable. Reporting these as an INFO
+            # "could not be checked" line buried an unpatchable path traversal
+            # that affected the site whatever it was running.
+            matched = [dict(row, affected_version="", every_release=True)
+                       for row in _every_release_rows(
+                           lookup["record"],
+                           (entry["wporg"] or {}).get("current_version", ""))]
         entry["vulnerabilities"] = sorted(matched, key=lambda r: r["score"],
                                           reverse=True)
         entry["undecidable"] = undecidable
@@ -2402,6 +2474,11 @@ def collect_vulns(ctx: RunContext) -> Tuple[str, int, str]:
         if versions:
             rows, undecidable = _vuln_rows(lookup["record"], versions[0])
             rows = [dict(r, affected_version=versions[0]) for r in rows]
+        else:
+            rows = [dict(row, affected_version="", every_release=True)
+                    for row in _every_release_rows(
+                        lookup["record"],
+                        (entry["wporg"] or {}).get("current_version", ""))]
         entry["vulnerabilities"] = rows
         entry["undecidable"] = undecidable
         data["themes"][slug] = entry
@@ -3507,6 +3584,15 @@ def check_vulns(ctx: RunContext) -> List[Finding]:
                                 f"{other}, which was not measured. "
                                 "Confirm on the Plugins screen.")
                 severity = cap_severity(severity, "MEDIUM")
+            if top.get("every_release"):
+                # Nothing was measured, and nothing needed to be: the range
+                # has no lower bound and reaches the current release.
+                current = (entry.get("wporg") or {}).get("current_version", "")
+                version_text = (
+                    "not read, and it does not decide this: the issue has no "
+                    "lower bound and still covers the current release"
+                    + (f" ({current})" if current else "")
+                    + ", so every installed version is affected")
             if SEVERITY_ORDER.index(severity) < SEVERITY_ORDER.index(worst):
                 worst = severity
             rows.append({
@@ -3515,8 +3601,7 @@ def check_vulns(ctx: RunContext) -> List[Finding]:
                 "Known issues": len(entry["vulnerabilities"]),
                 "Worst CVSS": f"{top['score']:.1f}" if top["score"] else "unscored",
                 "Reference": top["cve"] or top["name"][:60],
-                "Fixed in": top["fixed_in"] or ("no fix published"
-                                                if top["unfixed"] else ""),
+                "Fixed in": fix_text(top),
                 "Pages carrying it": entry.get("pages", 0) or "not read from pages",
             })
         findings.append(Finding(
@@ -3771,7 +3856,11 @@ def check_vulns(ctx: RunContext) -> List[Finding]:
                               (" from asset URLs, and readme.txt is blocked "
                                f"by the edge (HTTP {entry.get('readme_status')})"
                                if blocked else " from asset URLs or readme.txt"))
-                           + ", so no range could be matched")
+                           + (", so only issues covering every release could "
+                              "be matched (those are reported above)"
+                              if any(v.get("every_release")
+                                     for v in entry.get("vulnerabilities") or [])
+                              else ", so no range could be matched"))
         if entry.get("undecidable"):
             reasons.append(f"{entry['undecidable']} record(s) used a version "
                            "range this tool does not interpret")
@@ -4799,6 +4888,38 @@ def selftest() -> int:
     check("only the covering record matches", [r["name"] for r in rows], ["affected"])
     check("the CVE is carried through", rows[0]["cve"], "CVE-2026-0001")
     check("an undecidable record is counted, not dropped", undecidable, 1)
+
+    # 18b. A component whose version could not be read is still matchable
+    #      against records that cover every release. The unfixed shape below
+    #      is the common one: no lower bound, upper bound at the current
+    #      release, no fix to update to. Reporting it as "not checked" is
+    #      what this exists to stop.
+    everywhere = {"vulnerability": [
+        {"name": "unpatched, whole range",
+         "operator": {"max_version": "1.7.1", "max_operator": "le",
+                      "unfixed": "1"},
+         "impact": {"cvss": {"score": "4.9"}},
+         "source": [{"id": "CVE-2026-0002"}]},
+        {"name": "old, long fixed",
+         "operator": {"max_version": "1.2.4", "max_operator": "lt"},
+         "impact": {}, "source": []},
+        {"name": "only recent releases",
+         "operator": {"min_version": "1.5", "min_operator": "ge",
+                      "max_version": "1.7.1", "max_operator": "le"},
+         "impact": {}, "source": []},
+    ]}
+    everywhere_rows = _every_release_rows(everywhere, "1.7.1")
+    check("a whole-range record matches with no version detected",
+          [r["name"] for r in everywhere_rows], ["unpatched, whole range"])
+    check("no current release means no whole-range claim",
+          _every_release_rows(everywhere, ""), [])
+    check("an unfixed record never names its own range as the fix",
+          fix_text(everywhere_rows[0]), "no fix published")
+    check("a `< x` record names x as the fix",
+          fix_text({"fixed_in": "1.2.4", "max_operator": "lt"}), "1.2.4")
+    check("a `<= x` record does not name x as the fix",
+          fix_text({"fixed_in": "1.7.1", "max_operator": "le"}),
+          "a release later than 1.7.1")
 
     # 19. Several Set-Cookie headers. A dict comprehension keeps only the
     #     last one, and splitting on commas breaks on an Expires date. Seen
