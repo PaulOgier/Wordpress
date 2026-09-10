@@ -215,7 +215,7 @@ from typing import Dict, List, Optional, Tuple
 # CONFIGURATION
 ###############################################################################
 
-SCRIPT_VERSION = "1.5.0"
+SCRIPT_VERSION = "1.6.0"
 
 # [OPTIONAL] Startup check against the remote VERSION file. Fail-silent.
 CHECK_FOR_UPDATES = True
@@ -2126,6 +2126,48 @@ def collect_media(ctx: RunContext) -> Tuple[str, int, str]:
     return ("partial" if stopped else "ok"), len(items), note
 
 
+def previous_documents(run_dir: Path) -> Tuple[str, List[Dict]]:
+    """The most recent earlier run for the same host that has documents.json.
+
+    Run directories are named <host>_<YYYYMMDD>_<HHMMSS>, so the name sorts by
+    time. Only names older than this run count: a resumed old run must not
+    inherit from a newer one. Returns ("", []) when there is none.
+    """
+    host = run_dir.name.rsplit("_", 2)[0]
+    pattern = re.compile(re.escape(host) + r"_\d{8}_\d{6}$")
+    earlier = sorted((d for d in run_dir.parent.glob(f"{host}_*")
+                      if pattern.match(d.name) and d.name < run_dir.name
+                      and (d / "documents.json").is_file()),
+                     key=lambda d: d.name, reverse=True)
+    for d in earlier:
+        try:
+            rows = json.loads((d / "documents.json").read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            print_warning(f"documents: {d.name}/documents.json unreadable, "
+                          "trying the run before it")
+            continue
+        if isinstance(rows, list):
+            return d.name, rows
+    return "", []
+
+
+def _check_document(url: str, library: set) -> Dict:
+    """HEAD one document URL (GET for one byte where HEAD is refused)."""
+    status, hdrs, _ = fetch(url, method="HEAD")
+    if status in (405, 501):
+        # Some hosts refuse HEAD. A GET capped at one byte of body is
+        # the same question asked politely.
+        status, hdrs, _ = fetch(url, max_bytes=1)
+    return {
+        "url": url,
+        "status": status,
+        "bytes": hdrs.get("content-length", ""),
+        "content_type": hdrs.get("content-type", ""),
+        "in_library": url.split("?")[0] in library,
+        "sensitive": sensitive_hits(urllib.parse.urlparse(url).path.lower()),
+    }
+
+
 def collect_documents(ctx: RunContext) -> Tuple[str, int, str]:
     """Confirm each document resolves, and flag filenames worth opening.
 
@@ -2133,6 +2175,12 @@ def collect_documents(ctx: RunContext) -> Tuple[str, int, str]:
     search engine. That is how the files an older install left behind get
     into the report at all: they are on disk, readable by URL, absent from
     the media library, and invisible in wp-admin.
+
+    Every URL in the previous run's documents.json is re-checked too. The
+    discovery routes do not return the same set every time: on 2026-09-07 and
+    2026-09-10 a re-run found 30 documents, lost the 12 known orphans, and the
+    report read as an improvement. A URL still answering 200 is carried
+    forward; one that no longer does is reported as removed, never dropped.
     """
     media = ctx.data("media") or {}
     library = {u.split("?")[0] for u in media.get("all_urls", [])}
@@ -2145,30 +2193,53 @@ def collect_documents(ctx: RunContext) -> Tuple[str, int, str]:
     ctx.manifest["meta"]["extra_urls"] = merged
     ctx.save()
     extra = [u if u.startswith("http") else ctx.site + u for u in merged]
-    if ctx.data("media") is None and not extra:
+    prev_run, prev_rows = previous_documents(ctx.run_dir)
+    if ctx.data("media") is None and not extra and not prev_rows:
         # Nothing to confirm. "ok, 0 rows" here read as "no documents" when
         # the media module had been skipped and no document was ever listed.
         ctx.write("documents", [])
         return ("skipped", 0, "depends on the media module, which did not "
                               "run, and no --url was given")
     rows = []
-    for url in candidates + [u for u in extra if u not in candidates]:
+    discovered = list(dict.fromkeys(candidates + extra))
+    for url in discovered:
         if shutdown_requested:
             break
-        status, hdrs, _ = fetch(url, method="HEAD")
-        if status in (405, 501):
-            # Some hosts refuse HEAD. A GET capped at one byte of body is
-            # the same question asked politely.
-            status, hdrs, _ = fetch(url, max_bytes=1)
-        name = urllib.parse.urlparse(url).path.lower()
-        rows.append({
-            "url": url,
-            "status": status,
-            "bytes": hdrs.get("content-length", ""),
-            "content_type": hdrs.get("content-type", ""),
-            "in_library": url.split("?")[0] in library,
-            "sensitive": sensitive_hits(name),
-        })
+        rows.append(_check_document(url, library))
+
+    carried = removed = unmeasured = 0
+    if not prev_run:
+        print_info("documents: no previous run for this host, nothing to "
+                   "carry forward")
+    seen = set(discovered)
+    for prev in prev_rows:
+        url = prev.get("url", "")
+        if not url or url in seen or shutdown_requested:
+            continue
+        seen.add(url)
+        row = _check_document(url, library)
+        if row["status"] == 200:
+            row["carried_from"] = prev_run
+            carried += 1
+        elif row["status"] == 0:
+            # A failed request says nothing about the file. Keep it so the
+            # next run asks again, but it is not reported as removed.
+            row["carried_from"] = prev_run
+            unmeasured += 1
+        else:
+            # Keep the run it first went missing after, so a file gone for
+            # three runs does not look freshly removed on each.
+            row["removed_since"] = prev.get("removed_since") or prev_run
+            removed += 1
+        rows.append(row)
+    carry = {"previous_run": prev_run, "discovered": len(discovered),
+             "carried": carried, "removed": removed, "unmeasured": unmeasured}
+    ctx.manifest["meta"]["documents_carry"] = carry
+    ctx.save()
+    if prev_run:
+        print_info(f"documents: {len(discovered)} discovered on this run, "
+                   f"{carried} carried forward from {prev_run}, {removed} "
+                   f"removed since, {unmeasured} unmeasured (request failed)")
     ctx.write("documents", rows)
     return "ok", len(rows), ""
 
@@ -3279,7 +3350,9 @@ def check_documents(ctx: RunContext) -> List[Finding]:
             "and delete the rest. Anything already indexed also needs a "
             "removal request in Google Search Console.",
             [{"URL": r["url"], "Bytes": r["bytes"], "Type": r["content_type"],
-              "Flagged words": ", ".join(r["sensitive"]) or "-"}
+              "Flagged words": ", ".join(r["sensitive"]) or "-",
+              "Found on": ("run " + r["carried_from"]) if r.get("carried_from")
+              else "this run"}
              for r in orphans], "documents.json", len(orphans)))
 
     sensitive = [r for r in live if r["sensitive"]]
@@ -3326,7 +3399,24 @@ def check_documents(ctx: RunContext) -> List[Finding]:
               "Bytes": r["bytes"]} for r in sensitive],
             "documents.json", len(sensitive)))
 
-    dead = [r for r in rows if r["status"] not in (200, 0)]
+    removed = [r for r in rows if r.get("removed_since")]
+    if removed:
+        findings.append(Finding(
+            "docs-removed", "INFO",
+            f"{len(removed)} document(s) found on an earlier run no longer "
+            "resolve",
+            "Each of these answered 200 on the earlier run named beside it "
+            "and does not now. That is the evidence that a file was actually "
+            "removed, rather than missed by this run's discovery.",
+            "Nothing to do if the removal was intended. If a search engine "
+            "still lists the URL, a removal request in Google Search Console "
+            "clears it faster.",
+            [{"URL": r["url"], "Status now": r["status"],
+              "Last seen on run": r["removed_since"]} for r in removed],
+            "documents.json", len(removed)))
+
+    dead = [r for r in rows
+            if r["status"] not in (200, 0) and not r.get("removed_since")]
     if dead:
         findings.append(Finding(
             "docs-dead", "INFO",
@@ -4388,6 +4478,19 @@ def _coverage_block(ctx: RunContext) -> str:
         rows += (f"<tr><td>{escape(title)}</td>"
                  f"<td>{escape(entry['status'])}</td>"
                  f"<td>{escape(note or '-')}</td></tr>")
+    carry = ctx.manifest["meta"].get("documents_carry") or {}
+    if carry.get("carried") or carry.get("removed") or carry.get("unmeasured"):
+        rows += (
+            "<tr><td>Public documents (discovery)</td><td>gap</td><td>"
+            + escape(f"this run's discovery found {carry['discovered']} "
+                     f"document(s) and missed {carry['carried']} that run "
+                     f"{carry['previous_run']} had and that still answer 200; "
+                     "they were re-checked and are included above. "
+                     f"{carry['removed']} no longer resolve and "
+                     f"{carry['unmeasured']} could not be requested. A "
+                     "document neither run found is still invisible, so pair "
+                     "the report with a search-engine sweep.")
+            + "</td></tr>")
     for name, err in sorted((ctx.manifest["meta"].get("check_errors") or {}).items()):
         rows += (f"<tr><td>{escape(name)} (findings engine)</td>"
                  f"<td>error</td><td>{escape('this check crashed and produced no findings: ' + err)}</td></tr>")
@@ -5150,6 +5253,76 @@ def selftest() -> int:
               behind["outdated"], True)
     finally:
         globals()["fetch"] = real_fetch3
+
+    # 31. A document an earlier run found and this run's discovery missed.
+    #     Twice on one live site a re-run lost the 12 known orphans and the
+    #     report read as a fix. Still 200 is carried forward, a 404 is
+    #     reported as removed, and neither is silently dropped.
+    import tempfile
+    real_fetch4 = fetch
+    with tempfile.TemporaryDirectory() as tmp:
+        base = "https://x.test/wp-content/uploads/"
+        prev_dir = Path(tmp) / "x_test_20260901_000000"
+        cur_dir = Path(tmp) / "x_test_20260910_000000"
+        other = Path(tmp) / "y_test_20260905_000000"   # another host
+        for d in (prev_dir, cur_dir, other):
+            d.mkdir()
+        (prev_dir / "documents.json").write_text(json.dumps([
+            {"url": base + "a.pdf", "status": 200},
+            {"url": base + "2018/orphan.pdf", "status": 200},
+            {"url": base + "2018/gone.pdf", "status": 200}]))
+        (other / "documents.json").write_text(json.dumps(
+            [{"url": base + "y.pdf", "status": 200}]))
+        (cur_dir / "media.json").write_text(json.dumps(
+            {"all_urls": [base + "a.pdf"], "documents": [{"url": base + "a.pdf"}]}))
+        args = argparse.Namespace(url=[], site="https://x.test")
+        try:
+            globals()["fetch"] = lambda url, **k: (
+                (404 if "gone" in url else 200),
+                {"content-type": "application/pdf"}, "")
+            ctx = RunContext(cur_dir, args)
+            collect_documents(ctx)
+            rows = {r["url"].rsplit("/", 1)[1]: r for r in ctx.data("documents")}
+            check("carry: previous run's missed orphan is back, marked",
+                  (rows["orphan.pdf"]["status"],
+                   rows["orphan.pdf"].get("carried_from")),
+                  (200, "x_test_20260901_000000"))
+            check("carry: a URL no longer 200 is reported as removed",
+                  rows["gone.pdf"].get("removed_since"), "x_test_20260901_000000")
+            check("carry: another host's run is not inherited",
+                  "y.pdf" in rows, False)
+            check("carry: discovered, carried, removed counts",
+                  {k: ctx.manifest["meta"]["documents_carry"][k]
+                   for k in ("discovered", "carried", "removed")},
+                  {"discovered": 1, "carried": 1, "removed": 1})
+            fids = [f.fid for f in check_documents(ctx)]
+            check("carry: orphan and removed findings both present",
+                  ("docs-orphan" in fids, "docs-removed" in fids,
+                   "docs-dead" in fids), (True, True, False))
+            # The carried row persists: a third run whose discovery misses
+            # it again still inherits it from this run.
+            nxt = Path(tmp) / "x_test_20260911_000000"
+            nxt.mkdir()
+            (nxt / "media.json").write_text((cur_dir / "media.json").read_text())
+            ctx3 = RunContext(nxt, args)
+            collect_documents(ctx3)
+            rows3 = {r["url"].rsplit("/", 1)[1]: r for r in ctx3.data("documents")}
+            check("carry: inherited again from the carrying run",
+                  rows3["orphan.pdf"].get("carried_from"), "x_test_20260910_000000")
+            check("carry: removed keeps the run it went missing after",
+                  rows3["gone.pdf"].get("removed_since"), "x_test_20260901_000000")
+            # No previous run: nothing carried, nothing crashes.
+            lone = Path(tmp) / "z_test_20260910_000000"
+            lone.mkdir()
+            (lone / "media.json").write_text((cur_dir / "media.json").read_text())
+            ctx4 = RunContext(lone, args)
+            collect_documents(ctx4)
+            check("carry: no previous run yields only discovered rows",
+                  (len(ctx4.data("documents")),
+                   ctx4.manifest["meta"]["documents_carry"]["previous_run"]),
+                  (1, ""))
+        finally:
+            globals()["fetch"] = real_fetch4
 
     if failures:
         print("selftest FAILED:")
