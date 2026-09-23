@@ -215,7 +215,7 @@ from typing import Dict, List, Optional, Tuple
 # CONFIGURATION
 ###############################################################################
 
-SCRIPT_VERSION = "1.6.0"
+SCRIPT_VERSION = "1.7.0"
 
 # [OPTIONAL] Startup check against the remote VERSION file. Fail-silent.
 CHECK_FOR_UPDATES = True
@@ -247,6 +247,8 @@ REST_INDEX_MAX_BYTES = 8_000_000
 
 # [OPTIONAL] Limits.
 EVIDENCE_ROWS = 12           # evidence rows shown per finding in the report
+EVIDENCE_ROWS_ALL = 5_000    # --standalone: the reader has no run
+                             # directory, so truncating hides the rest
 MEDIA_MAX_PAGES = 200        # pages of 100 media items before giving up
 ASSET_MAX_PAGES = 80         # sitemap URLs fetched for the version sweep
 CALIBRATION_PROBES = 3       # nonsense paths requested to learn the 404 shape
@@ -449,54 +451,140 @@ CORE_NAMESPACES = {"oembed/1.0", "wp/v2", "wp-site-health/v1",
 # None where the directory name is not known with confidence; guessing one
 # would be probing for plugins the site never advertised, which this tool does
 # not do. Unknown namespaces are shown as-is.
+#
+# A slug is set only when the namespace string appears in that one plugin's
+# source and no other's. A namespace from a shared vendor package (Jetpack's
+# jetpack_vendor, Elementor's wp-one-package, WPChill's admin library) names
+# the family with no slug: a slug sends the plugin to the vulnerability
+# lookup, and an unreadable readme there matches every advisory that covers
+# all releases. Matching is exact, never by prefix: elementor/v1/blog and
+# wc/store/marketplace are the vendors' own site code, in no public plugin.
+# Entries added 2026-09-23 were checked against the wordpress.org source.
 NAMESPACE_PLUGINS: Dict[str, Tuple[str, Optional[str]]] = {
     "acf/v3": ("Advanced Custom Fields", "advanced-custom-fields"),
+    "age-gate/v3": ("Age Gate", "age-gate"),
     "aioseo/v1": ("All in One SEO", "all-in-one-seo-pack"),
     "akismet/v1": ("Akismet", "akismet"),
     "apple-news/v1": ("Publish to Apple News", "publish-to-apple-news"),
     "bctt/v1": ("Better Click To Tweet", "better-click-to-tweet"),
+    "block-visibility/v1": ("Block Visibility", "block-visibility"),
     "buddypress/v1": ("BuddyPress", "buddypress"),
     "carbon-fields/v1": ("Carbon Fields", "carbon-fields"),
+    "categoryPosts": ("Category Posts", "category-posts"),
+    "caxton/v1": ("Caxton", "caxton"),
+    "ccb-gutenberg/v1": ("Cost Calculator Builder", "cost-calculator-builder"),
+    "cky/v1": ("CookieYes", "cookie-law-info"),
     "coauthors/v1": ("Co-Authors Plus", "co-authors-plus"),
     "code-snippets/v1": ("Code Snippets", "code-snippets"),
     "complianz/v1": ("Complianz", "complianz-gdpr"),
     "contact-form-7/v1": ("Contact Form 7", "contact-form-7"),
+    "cookie-notice/v1": ("Cookie Notice", "cookie-notice"),
+    "cookieyes/v1": ("CookieYes", "cookie-law-info"),
+    "download-monitor/v1": ("Download Monitor", "download-monitor"),
+    "duplicate-post/v1": ("Yoast Duplicate Post", "duplicate-post"),
     "duplicator/v1": ("Duplicator", "duplicator"),
+    "ea11y/v1": ("Ally by Elementor", "pojo-accessibility"),
     "elasticpress/v1": ("ElasticPress", "elasticpress"),
+    "elementor-ai/v1": ("Elementor", "elementor"),
+    "elementor-one/v1": ("Elementor, Ally or Image Optimizer", None),
     "elementor/v1": ("Elementor", "elementor"),
+    "elementor/v1/documents": ("Elementor", "elementor"),
+    "elementor/v1/feedback": ("Elementor", "elementor"),
     "fluent-smtp": ("FluentSMTP", "fluent-smtp"),
+    "forminator/v1": ("Forminator", "forminator"),
+    "get": ("Squirrly SEO", None),
     "gf/v2": ("Gravity Forms", "gravityforms"),
     "google-site-kit/v1": ("Site Kit by Google", "google-site-kit"),
     "health-check/v1": ("Health Check", "health-check"),
     "hostinger-ai-assistant/v1": ("Hostinger AI Assistant", None),
     "hostinger-tools-plugin/v1": ("Hostinger Tools", None),
+    "hub-connector/v1":
+        ("a WPMU DEV plugin (Forminator, Smush, Hummingbird or Broken Link Checker)", None),
+    "image-optimizer/v1":
+        ("Image Optimizer by Elementor", "image-optimization"),
     "ithemes-security/v1": ("Solid Security", "better-wp-security"),
-    "jetpack/v4": ("Jetpack", "jetpack"),
     "jetpack-boost/v1": ("Jetpack Boost", "jetpack-boost"),
+    "jetpack/v4": ("Jetpack", "jetpack"),
+    "jetpack/v4/blaze": ("Jetpack", None),
+    "jetpack/v4/blaze-app": ("Jetpack", None),
+    "jetpack/v4/explat": ("Jetpack or Jetpack Boost", None),
+    "jetpack/v4/import": ("Jetpack", None),
+    "jetpack/v4/stats-app": ("Jetpack or Jetpack Boost", None),
     "kadence-blocks/v1": ("Kadence Blocks", "kadence-blocks"),
+    "kirki/v1": ("Kirki", "kirki"),
     "litespeed/v1": ("LiteSpeed Cache", "litespeed-cache"),
     "litespeed/v3": ("LiteSpeed Cache", "litespeed-cache"),
     "mainwp/v1": ("MainWP Dashboard", "mainwp"),
     "mainwp/v2": ("MainWP Dashboard", "mainwp"),
+    "mc4wp/v1": ("MC4WP: Mailchimp for WordPress", "mailchimp-for-wp"),
     "mcp": ("MCP adapter", None),
-    "monsterinsights/v1": ("MonsterInsights", "google-analytics-for-wordpress"),
+    "metricool/v1": ("Metricool", "metricool"),
+    "monsterinsights/v1":
+        ("MonsterInsights", "google-analytics-for-wordpress"),
+    "my-jetpack/v1": ("Jetpack or Jetpack Boost", None),
+    "payments/woopay": ("WooPayments", "woocommerce-payments"),
+    "pinterest/v1": ("Pinterest for WooCommerce", "pinterest-for-woocommerce"),
+    "popup-maker/v2": ("Popup Maker", "popup-maker"),
+    "qsm": ("Quiz and Survey Master", "quiz-master-next"),
+    "quiz-survey-master/v1": ("Quiz and Survey Master", "quiz-master-next"),
+    "quiz-survey-master/v2": ("Quiz and Survey Master", "quiz-master-next"),
     "rankmath/v1": ("Rank Math SEO", "seo-by-rank-math"),
+    "rankmath/v1/ai-visibility": ("Rank Math SEO", "seo-by-rank-math"),
+    "rankmath/v1/an": ("Rank Math SEO", "seo-by-rank-math"),
+    "rankmath/v1/ca": ("Rank Math SEO", "seo-by-rank-math"),
+    "rankmath/v1/setupWizard": ("Rank Math SEO", "seo-by-rank-math"),
+    "rankmath/v1/status": ("Rank Math SEO", "seo-by-rank-math"),
     "redirection/v1": ("Redirection", "redirection"),
-    "regenerate-thumbnails/v1": ("Regenerate Thumbnails", "regenerate-thumbnails"),
+    "regenerate-thumbnails/v1":
+        ("Regenerate Thumbnails", "regenerate-thumbnails"),
+    "save": ("Squirrly SEO", None),
     "seopress/v1": ("SEOPress", "wp-seopress"),
     "sg-security/v1": ("SiteGround Security", "sg-security"),
-    "simple-page-ordering/v1": ("Simple Page Ordering", "simple-page-ordering"),
+    "simple-page-ordering/v1":
+        ("Simple Page Ordering", "simple-page-ordering"),
     "siteground-settings/v1": ("SiteGround Optimizer", "sg-cachepress"),
+    "squirrly": ("Squirrly SEO", "squirrly-seo"),
     "squirrly/v1": ("Squirrly SEO", "squirrly-seo"),
+    "ssp/v1": ("Seriously Simple Podcasting", "seriously-simple-podcasting"),
+    "test": ("Squirrly SEO", None),
     "tribe/events/v1": ("The Events Calendar", "the-events-calendar"),
     "two-factor/1.0": ("Two-Factor", "two-factor"),
+    "videopress/v1": ("Jetpack", None),
+    "wc-admin": ("WooCommerce", "woocommerce"),
+    "wc-admin-email": ("WooCommerce", "woocommerce"),
+    "wc-analytics": ("WooCommerce", "woocommerce"),
+    "wc-push-notifications": ("WooCommerce", "woocommerce"),
+    "wc-telemetry": ("WooCommerce", "woocommerce"),
+    "wc/pos/v1/catalog": ("WooCommerce", "woocommerce"),
+    "wc/private": ("WooCommerce", "woocommerce"),
+    "wc/store": ("WooCommerce", "woocommerce"),
+    "wc/store/v1": ("WooCommerce", "woocommerce"),
+    "wc/v1": ("WooCommerce", "woocommerce"),
+    "wc/v2": ("WooCommerce", "woocommerce"),
     "wc/v3": ("WooCommerce", "woocommerce"),
+    "wccom-site/v3": ("WooCommerce", "woocommerce"),
+    "weglot/v1": ("Weglot", "weglot"),
+    "weglot/v2": ("Weglot", "weglot"),
+    "woocommerce-analytics/v1": ("Jetpack", None),
+    "wordfence-login-security/v1": ("Wordfence Login Security", None),
     "wordfence/v1": ("Wordfence", "wordfence"),
+    "wordlift/v1": ("WordLift", "wordlift"),
     "wp-mail-smtp/v1": ("WP Mail SMTP", "wp-mail-smtp"),
     "wp-parsely/v2": ("Parse.ly", "wp-parsely"),
     "wp-rocket/v1": ("WP Rocket", "wp-rocket"),
+    "wp-rollback/v1": ("WP Rollback", "wp-rollback"),
+    "wpchill/v1": ("Download Monitor, Modula or Strong Testimonials", None),
+    "wpcom/v2": ("Jetpack", None),
+    "wpcom/v3": ("Jetpack", None),
     "wpforms/v1": ("WPForms", "wpforms-lite"),
+    "wpmudev_blc/v1": ("Broken Link Checker", "broken-link-checker"),
+    "wpmudev_pcs/v1":
+        ("a WPMU DEV plugin (Forminator, Smush, Hummingbird or Broken Link Checker)", None),
+    "wptelegram-bot/v1": ("WP Telegram", "wptelegram"),
+    "wptelegram/v1": ("WP Telegram", "wptelegram"),
     "yoast/v1": ("Yoast SEO", "wordpress-seo"),
+    "zapier/v1": ("Zapier for WordPress", "zapier"),
+    "zoninator/v1": ("Zoninator", "zoninator"),
 }
 NAMESPACE_NAMES = {ns: name for ns, (name, _) in NAMESPACE_PLUGINS.items()}
 
@@ -801,12 +889,22 @@ def fetch(url: str, method: str = "GET", timeout: int = REQUEST_TIMEOUT,
 RATE_LIMIT_PAUSE = 8          # seconds to wait after a 429 with no Retry-After
 RATE_LIMIT_MAX_PAUSE = 30
 RATE_LIMIT_GIVE_UP = 6        # consecutive 429s before retries stop
+RATE_LIMIT_RECOVER = 20      # clean requests in a row before the pace halves
+# Statuses that say nothing about the resource: refused, overloaded, or never
+# answered. A module that reads one of these reports "not examined", never
+# "closed, the safer state".
+UNMEASURED_STATUSES = (0, 429, 503)
 _slowdown = 1.0
 _consecutive_429 = 0
+_consecutive_ok = 0
 
 
 def _delay() -> float:
-    return REQUEST_DELAY * _slowdown
+    """The gap before the next request: the chosen pace times the slowdown,
+    capped at the longer of RATE_LIMIT_PAUSE and --delay itself. Uncapped,
+    --delay 2 against a Cloudflare limit reached 32 s a request and a path
+    sweep ran for over an hour without finishing."""
+    return min(REQUEST_DELAY * _slowdown, max(RATE_LIMIT_PAUSE, REQUEST_DELAY))
 
 
 def _back_off(headers) -> bool:
@@ -818,8 +916,9 @@ def _back_off(headers) -> bool:
     request through. Past that point refusals are recorded as rate limited
     without waiting, and the report says which paths were not checked.
     """
-    global _slowdown, _consecutive_429
+    global _slowdown, _consecutive_429, _consecutive_ok
     _consecutive_429 += 1
+    _consecutive_ok = 0
     if _consecutive_429 > RATE_LIMIT_GIVE_UP:
         return False
     try:
@@ -838,9 +937,18 @@ def _back_off(headers) -> bool:
 
 
 def _served() -> None:
-    """A request got through: the limiter has relented."""
-    global _consecutive_429
+    """A request got through: the limiter has relented.
+
+    The pace steps back down one halving per RATE_LIMIT_RECOVER clean
+    requests. Without this, one burst of 429s during calibration held a
+    Hostinger run at 8 s per request for its remaining 35 minutes.
+    """
+    global _consecutive_429, _consecutive_ok, _slowdown
     _consecutive_429 = 0
+    _consecutive_ok += 1
+    if _slowdown > 1.0 and _consecutive_ok >= RATE_LIMIT_RECOVER:
+        _slowdown = max(_slowdown / 2, 1.0)
+        _consecutive_ok = 0
 
 
 def fetch_no_redirect(url: str,
@@ -1028,8 +1136,24 @@ def _vuln_rows(record: Dict, version: str) -> Tuple[List[Dict], int]:
     Returns (matching rows, count of records that could not be decided).
     """
     matched, undecidable = [], 0
-    for entry in record.get("vulnerability") or []:
-        verdict = vuln_applies(version, entry.get("operator") or {})
+    entries = record.get("vulnerability") or []
+    # The same bug often arrives twice, once per source, and one copy can
+    # drop the lower bound: Oxygen's 6.0-6.1.1 access-control bug is listed
+    # as "< 6.1.2" by Patchstack and ">= 6.0 - < 6.1.2" by Wordfence, and
+    # the unbounded copy flagged every 4.x install. When a bounded record
+    # shares the upper bound and excludes this version, the unbounded one is
+    # undecidable rather than a finding. It is not dropped: a second bug
+    # fixed in the same release may really cover every version.
+    bounded = [(e.get("operator") or {}) for e in entries
+               if (e.get("operator") or {}).get("min_version")]
+    for entry in entries:
+        operator = entry.get("operator") or {}
+        verdict = vuln_applies(version, operator)
+        if verdict and not operator.get("min_version") and any(
+                b.get("max_version") == operator.get("max_version")
+                and b.get("max_operator") == operator.get("max_operator")
+                and vuln_applies(version, b) is False for b in bounded):
+            verdict = None
         if verdict is None:
             undecidable += 1
             continue
@@ -1609,6 +1733,15 @@ def collect_calibration(ctx: RunContext) -> Tuple[str, int, str]:
     signature = calibrate_missing(ctx.site)
     control = verify_calibration(ctx.site, signature)
     ctx.write("calibration", {"signature": signature, "control": control})
+    # A refusal is not the site's answer for a missing path. Learning one as
+    # the signature (one live site: three empty 429s) passes the robots.txt
+    # control and would then file every refused probe as absent.
+    if signature.get("status") in UNMEASURED_STATUSES:
+        return ("error", 0,
+                f"the missing-path probes were answered HTTP "
+                f"{signature['status']} (rate limited or unreachable), so "
+                "the site's not-found shape is unknown and the paths module "
+                "cannot run. Re-run with a larger --delay")
     if not control["trustworthy"]:
         return "error", 0, control["note"]
     if not control.get("ran"):
@@ -1910,7 +2043,7 @@ def collect_rest(ctx: RunContext) -> Tuple[str, int, str]:
                     "without JSON, so the REST API could not be read; a "
                     "challenge page or a non-WordPress front end is the "
                     "usual cause")
-        if any(a["status"] in (429, 503, 0) for a in attempts):
+        if any(a["status"] in UNMEASURED_STATUSES for a in attempts):
             return ("error", 0,
                     "the REST index could not be read: HTTP "
                     + "/".join(str(a["status"]) for a in attempts)
@@ -2026,6 +2159,11 @@ def collect_users(ctx: RunContext) -> Tuple[str, int, str]:
             result["oembed"] = author
 
     ctx.write("users", result)
+    if result["rest_status"] in UNMEASURED_STATUSES:
+        return ("partial", len(result["rest"]),
+                f"/wp/v2/users answered HTTP {result['rest_status']} (rate "
+                "limited or unreachable), so the REST user list was not "
+                "examined; the other three routes were")
     return "ok", len(result["rest"]), ""
 
 
@@ -2046,6 +2184,11 @@ def collect_media(ctx: RunContext) -> Tuple[str, int, str]:
     """
     probe_status, hdrs, probe = fetch_json(
         ctx.rest_url("/wp/v2/media?per_page=1&_fields=id"))
+    if probe_status in UNMEASURED_STATUSES:
+        ctx.write("media", {})
+        return ("error", 0,
+                f"the media endpoint answered HTTP {probe_status} (rate "
+                "limited or unreachable), so the library was not examined")
     if probe_status != 200 or not isinstance(probe, list):
         ctx.write("media", {})
         return ("empty", 0,
@@ -3952,8 +4095,10 @@ def check_vulns(ctx: RunContext) -> List[Finding]:
                                      for v in entry.get("vulnerabilities") or [])
                               else ", so no range could be matched"))
         if entry.get("undecidable"):
-            reasons.append(f"{entry['undecidable']} record(s) used a version "
-                           "range this tool does not interpret")
+            reasons.append(f"{entry['undecidable']} record(s) could not be "
+                           "decided: a version range this tool does not "
+                           "interpret, or two sources disagreeing on the "
+                           "first affected version")
         if reasons:
             gaps.append({"Component": f"{slug} ({'theme' if slug in themes else 'plugin'})",
                          "What was not checked": "; ".join(reasons)})
@@ -4238,10 +4383,13 @@ def _evidence_table(finding: Finding) -> str:
         body += f"<tr>{cells}</tr>"
     more = ""
     if finding.count > len(finding.evidence):
+        # --standalone readers have no run directory to be pointed at.
+        where = ("kept with the run this report came from"
+                 if EVIDENCE_ROWS >= EVIDENCE_ROWS_ALL else
+                 "in the run directory")
         more = (f"<p class='more'>Showing {len(finding.evidence)} of "
                 f"{finding.count}. The full list is in "
-                f"<code>{escape(finding.source)}</code> in the run "
-                f"directory.</p>")
+                f"<code>{escape(finding.source)}</code>, {where}.</p>")
     return (f"<div class='scroll'><table><thead><tr>{head}</tr></thead>"
             f"<tbody>{body}</tbody></table></div>{more}")
 
@@ -4571,7 +4719,13 @@ REPORT_CSS = """
            border-bottom: 1px solid #e4e7ea; overflow-wrap: break-word; }
   th { background: #f0f2f4; font-weight: 600; }
   table.kv th { width: 34%; background: #fafbfc; }
-  .scroll { overflow-x: auto; margin: 12px 0 4px; }
+  /* 50 text lines (13px x 1.55), so a --standalone table of thousands of
+     rows scrolls in its own box instead of stretching the page. */
+  .scroll { overflow: auto; max-height: 1008px; margin: 12px 0 4px; }
+  /* A collapsed border leaves a gap above a sticky header that rows show
+     through; separate borders with no spacing close it. */
+  .scroll table { border-collapse: separate; border-spacing: 0; }
+  .scroll thead th { position: sticky; top: 0; }
   .more { color: #667; font-size: 12px; }
   .good { color: #1d7a4c; }
   .bad { color: #c0392b; font-weight: 600; }
@@ -4593,7 +4747,7 @@ REPORT_CSS = """
     section.card, .tile { box-shadow: none; border: 1px solid #ccc; }
     .tile, tr { page-break-inside: avoid; }
     h2, h3 { page-break-after: avoid; }
-    .scroll { overflow: visible; }
+    .scroll { overflow: visible; max-height: none; }
     a { color: #222; text-decoration: none; }
   }
 """
@@ -4857,6 +5011,23 @@ def selftest() -> int:
                   [{"n": i} for i in range(EVIDENCE_ROWS + 5)], "s")
     check("evidence is capped", len(big.evidence), EVIDENCE_ROWS)
     check("truncation is disclosed", "Showing" in _evidence_table(big), True)
+
+    # 11b. --standalone lifts the cap. The flag rebinds the global, so this
+    #      test does what main() does rather than calling Finding differently.
+    saved = EVIDENCE_ROWS
+    globals()["EVIDENCE_ROWS"] = EVIDENCE_ROWS_ALL
+    try:
+        whole = Finding("y2", "INFO", "t", "m", "r",
+                        [{"n": i} for i in range(saved + 5)], "s")
+        check("standalone keeps every row", len(whole.evidence), saved + 5)
+        check("standalone under the cap shows no truncation note",
+              "Showing" in _evidence_table(whole), False)
+        over = Finding("y3", "INFO", "t", "m", "r",
+                       [{"n": 1}], "s", count=EVIDENCE_ROWS_ALL + 1)
+        check("standalone over the cap names no run directory",
+              "run directory" in _evidence_table(over), False)
+    finally:
+        globals()["EVIDENCE_ROWS"] = saved
 
     # 12. Report HTML escapes evidence: a filename is attacker-influenced
     #     input and must not become markup.
@@ -5324,6 +5495,61 @@ def selftest() -> int:
         finally:
             globals()["fetch"] = real_fetch4
 
+    # 32. A rate-limit refusal is never the site's answer. Three live runs
+    #     on 2026-09-23 read 429s as "closed, the safer state", learned a
+    #     429 as the not-found shape, and exited 0 with checks unrun.
+    g = globals()
+    saved = {k: g[k] for k in ("calibrate_missing", "verify_calibration",
+                               "fetch_json", "fetch", "fetch_no_redirect",
+                               "_slowdown", "_consecutive_ok")}
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx = RunContext(Path(tmp), argparse.Namespace(
+                url=[], site="https://x.test"))
+            g["calibrate_missing"] = lambda site: {"status": 429}
+            g["verify_calibration"] = lambda site, sig: {
+                "trustworthy": True, "ran": True, "note": ""}
+            check("429: calibration learned from refusals is an error",
+                  collect_calibration(ctx)[0], "error")
+            g["fetch_json"] = lambda url: (429, {}, None)
+            g["fetch_no_redirect"] = lambda url: (404, {})
+            g["fetch"] = lambda url, **kw: (404, {}, "")
+            check("429: a refused media probe is an error, not closed",
+                  collect_media(ctx)[0], "error")
+            check("429: a refused users endpoint is partial, not ok",
+                  collect_users(ctx)[0], "partial")
+        g["_slowdown"], g["_consecutive_ok"] = 16.0, 0
+        for _ in range(RATE_LIMIT_RECOVER):
+            _served()
+        check("429: the pace halves after a run of clean requests",
+              g["_slowdown"], 8.0)
+        real_rd = g["REQUEST_DELAY"]
+        g["REQUEST_DELAY"], g["_slowdown"] = 2.0, 16.0
+        check("429: the slowdown never waits more than 8 s", _delay(), 8.0)
+        g["REQUEST_DELAY"] = real_rd
+    finally:
+        g.update(saved)
+    # 33. Two sources for one bug, one missing the lower bound (the live
+    #     Oxygen record, 2026-09-23). 4.9.8 is outside 6.0-6.1.1.
+    loose = {"name": "Oxygen < 6.1.2", "operator": {
+        "max_version": "6.1.2", "max_operator": "lt"}}
+    tight = {"name": "Oxygen 6.0 - 6.1.1", "operator": {
+        "min_version": "6.0", "min_operator": "ge",
+        "max_version": "6.1.2", "max_operator": "lt"}}
+    rows, undecided = _vuln_rows({"vulnerability": [loose, tight]}, "4.9.8")
+    check("sibling bound: 4.x is not matched by a 6.x bug", len(rows), 0)
+    check("sibling bound: the loose record is undecidable, not dropped",
+          undecided, 1)
+    rows, _ = _vuln_rows({"vulnerability": [loose, tight]}, "6.1.0")
+    check("sibling bound: a version inside the range still matches",
+          len(rows), 2)
+    rows, _ = _vuln_rows({"vulnerability": [loose]}, "4.9.8")
+    check("sibling bound: an unbounded record alone still matches",
+          len(rows), 1)
+
+    check("--delay is read as seconds",
+          parse_args(["--delay", "2", "--selftest"]).delay, 2.0)
+
     if failures:
         print("selftest FAILED:")
         for f in failures:
@@ -5438,6 +5664,17 @@ def parse_args(argv=None):
                              "(for headless or scheduled runs)")
     parser.add_argument("--no-colour", action="store_true",
                         help="Plain console output")
+    parser.add_argument("--delay", type=float, default=REQUEST_DELAY,
+                        help=f"Seconds between requests (default "
+                        f"{REQUEST_DELAY}). Raise it for a host that bans "
+                        "by volume without sending 429s first; 2 caps it at "
+                        "30 requests a minute")
+    parser.add_argument("--standalone", action="store_true",
+                        help="Put every evidence row in the report instead "
+                             "of the first "
+                             f"{EVIDENCE_ROWS}. For a report sent on its own, "
+                             "as a link or a file, where the reader has no "
+                             "run directory to read the JSON in")
     parser.add_argument("--selftest", action="store_true",
                         help="Run the logic tests and exit; no network")
     args = parser.parse_args(argv)
@@ -5486,6 +5723,13 @@ def main(argv=None):
     signal.signal(signal.SIGINT, signal_handler)
 
     args = parse_args(argv)
+    # A host firewall that drops the IP gives no 429, so the adaptive
+    # back-off never fires; the only lever is a slower pace from the start.
+    globals()["REQUEST_DELAY"] = max(args.delay, 0.0)
+    # Finding.__init__ reads this at call time, so rebinding it here covers
+    # every finding without threading a flag through the check functions.
+    if args.standalone:
+        globals()["EVIDENCE_ROWS"] = EVIDENCE_ROWS_ALL
     if args.no_colour:
         Colours.strip_colours()
     if args.selftest:
@@ -5541,14 +5785,23 @@ def main(argv=None):
 
     worst = next((f.severity for f in findings
                   if f.severity in ("CRITICAL", "HIGH")), None)
+    # A module in error measured nothing, so "no critical or high findings"
+    # would be a statement about checks that never ran (one live site:
+    # calibration and REST both refused, exit 0).
+    unmeasured = sorted(k for k, v in ctx.manifest["modules"].items()
+                        if v.get("status") == "error")
     if worst:
         print_warning(f"Highest severity found: {worst}. "
                       "Open exposure_report.html for the detail.")
+    elif unmeasured:
+        print_warning("No critical or high findings, but these modules "
+                      f"measured nothing: {', '.join(unmeasured)}. The run "
+                      "is incomplete, not clean.")
     else:
         print_success("No critical or high findings. Read the Coverage and "
                       "Methodology sections before calling the site clean.")
     open_report(report_path, args)
-    return 1 if worst else 0
+    return 1 if worst else 3 if unmeasured else 0
 
 
 if __name__ == "__main__":

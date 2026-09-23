@@ -59,9 +59,10 @@ one anchored card per finding, and five reference sections: the site profile,
 every path checked including the clean ones, coverage gaps, what the tool
 checks, and the methodology.
 
-Exit code is `1` when anything CRITICAL or HIGH was found, `0` otherwise, `130`
-if you stopped it with Ctrl-C. That makes it usable as a gate in a scheduled
-job.
+Exit code is `1` when anything CRITICAL or HIGH was found, `3` when nothing
+was but a module could not measure at all (rate limited or unreachable), `0`
+otherwise, `130` if you stopped it with Ctrl-C. That makes it usable as a
+gate in a scheduled job.
 
 ## Safety posture
 
@@ -299,6 +300,12 @@ HIGH, because nobody inside WordPress can see it to review it.
 --list               Print the module registry and exit
 --no-open            Do not open the report in a browser (headless, cron)
 --no-colour          Plain console output
+--delay SECONDS      Seconds between requests (default 0.15). Raise it for a
+                     host that bans by volume without sending a 429 first;
+                     2 keeps a run under 30 requests a minute.
+--standalone         Put up to 5000 evidence rows per finding in the report
+                     instead of 12. For a report sent on its own, where the
+                     reader has no run directory to open the JSON in.
 --selftest           Run the logic tests and exit; no network
 ```
 
@@ -324,9 +331,13 @@ python3 wp_audit.py --run-dir wp_audit_runs/www_example_com_20260903_190000
 python3 wp_audit.py --run-dir wp_audit_runs/www_example_com_20260903_190000 \
     --render-only
 
+# Re-render a finished run as a report to send on its own.
+python3 wp_audit.py --run-dir wp_audit_runs/www_example_com_20260903_190000 \
+    --render-only --standalone
+
 # Scheduled, gated on severity.
 python3 wp_audit.py --site https://www.example.com --no-open --no-colour \
-    || echo "critical or high findings; see the report"
+    || echo "critical or high findings, or an incomplete run; see the report"
 ```
 
 ### How a run behaves
