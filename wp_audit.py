@@ -215,7 +215,7 @@ from typing import Dict, List, Optional, Tuple
 # CONFIGURATION
 ###############################################################################
 
-SCRIPT_VERSION = "1.7.0"
+SCRIPT_VERSION = "1.8.0"
 
 # [OPTIONAL] Startup check against the remote VERSION file. Fail-silent.
 CHECK_FOR_UPDATES = True
@@ -285,6 +285,10 @@ PROBE_PATHS: List[Tuple[str, str, str]] = [
     ("/wp-config.php~", "CRITICAL", "an editor backup of the WordPress configuration file"),
     ("/wp-config.php.save", "CRITICAL", "an editor backup of the WordPress configuration file"),
     ("/wp-config.txt", "CRITICAL", "the WordPress configuration file as plain text"),
+    ("/wp-config.old", "CRITICAL", "an old copy of the WordPress configuration file, which contains the database password"),
+    ("/wp-config.php.old", "CRITICAL", "an old copy of the WordPress configuration file, which contains the database password"),
+    ("/wp-config.php.orig", "CRITICAL", "a copy of the WordPress configuration file, which contains the database password"),
+    ("/wp-config.bak", "CRITICAL", "a backup of the WordPress configuration file, which contains the database password"),
     ("/.env", "CRITICAL", "an environment file, which usually holds API keys and database credentials"),
     ("/.git/config", "CRITICAL", "a Git repository, from which the whole source tree can be reconstructed"),
     ("/.git/HEAD", "CRITICAL", "a Git repository, from which the whole source tree can be reconstructed"),
@@ -363,6 +367,10 @@ CONTENT_MARKERS: Dict[str, Tuple[str, ...]] = {
     "/wp-config.php~": ("db_name", "db_password", "<?php"),
     "/wp-config.php.save": ("db_name", "db_password", "<?php"),
     "/wp-config.txt": ("db_name", "db_password", "<?php"),
+    "/wp-config.old": ("db_name", "db_password", "<?php"),
+    "/wp-config.php.old": ("db_name", "db_password", "<?php"),
+    "/wp-config.php.orig": ("db_name", "db_password", "<?php"),
+    "/wp-config.bak": ("db_name", "db_password", "<?php"),
     "/wp-content/debug.log": ("php ", "[", "warning", "notice", "error"),
     "/error_log": ("php ", "[", "warning", "notice", "error"),
     "/phpinfo.php": ("phpinfo()", "php version"),
@@ -388,6 +396,26 @@ CONTENT_MARKERS: Dict[str, Tuple[str, ...]] = {
 # files as "not readable" on a static site.
 WORDPRESS_ONLY_PATHS = {"/readme.html", "/license.txt", "/installer.php",
                         "/installer-backup.php", "/dup-installer/"}
+
+# Copies of wp-config.php whose names end in .php. The server runs these
+# rather than sending them, and a configuration file defines constants and
+# prints nothing, so a real copy answers HTTP 200 with an empty body. No
+# content marker can match that; the empty 200 is the evidence, and only
+# after calibrate_exec() has shown an unknown .php here answers differently.
+EXEC_CONFIG_PATHS: List[Tuple[str, str, str]] = [
+    (path, "MEDIUM", "a stale copy of the WordPress configuration file that "
+                     "the server runs; its contents, including the database "
+                     "password, leak if PHP ever stops handling the file")
+    for path in ("/wp-config_old.php", "/wp-config-old.php",
+                 "/wp-config.old.php", "/wp-config-backup.php")]
+
+# Core files that print nothing when PHP runs them: the positive control for
+# the empty-200 rule, tried in order. wp-load.php comes first because it sits
+# in the web root beside the copies; Hostinger 403s every .php under
+# wp-content and wp-includes, and so do some hardening plugins.
+EXEC_CONTROL_PATHS = ("/wp-load.php", "/wp-content/index.php",
+                      "/wp-includes/version.php")
+
 SQL_MARKERS = ("insert into", "create table", "-- mysql dump", "-- phpmyadmin",
                "drop table", "/*!40101")
 
@@ -1568,6 +1596,69 @@ def path_verdict(path: str, status: int, body: str, exposed: bool,
     return "not readable"
 
 
+def exec_copy_is_hit(status: int, no_redirect_status: Optional[int],
+                     body: str) -> bool:
+    """Did a .php path answer the way PHP running a config file does?
+
+    A 200 with no redirect and nothing but whitespace in the body. A soft
+    404 and a WAF page both carry a body, so neither qualifies. This is only
+    evidence once calibrate_exec() has shown the site does not answer every
+    unknown .php the same way.
+    """
+    return status == 200 and no_redirect_status == 200 and not body.strip()
+
+
+def calibrate_exec(site: str) -> Dict:
+    """Can an empty 200 on a .php path be read as a real file that ran?
+
+    Two nonsense paths are requested: a bare one, and one shaped like the
+    copies probed, so a server rule keyed on "wp-config" is measured too.
+    Either answering an empty 200 means the signal belongs to the site, not
+    the file, and the rule stands down. Then the positive control: a core
+    file that prints nothing when run must still be classified a hit, or the
+    rule would suppress real copies and the report would read as clean.
+    """
+    out = {"usable": False, "control_path": "", "control_ran": False,
+           "note": ""}
+    for path in (f"/zz-does-not-exist-{uuid.uuid4().hex[:16]}.php",
+                 f"/wp-config-zz-{uuid.uuid4().hex[:16]}.php"):
+        no_redirect_status, _ = fetch_no_redirect(site + path)
+        status, _, body = fetch(site + path)
+        if (status in UNMEASURED_STATUSES
+                or no_redirect_status in UNMEASURED_STATUSES):
+            out["note"] = (
+                f"a .php path that cannot exist was answered HTTP {status} "
+                "(rate limited or unreachable), so the check for "
+                "configuration copies the server runs was not run")
+            return out
+        if exec_copy_is_hit(status, no_redirect_status, body):
+            out["note"] = (
+                "this site answers a .php path that cannot exist with an "
+                "empty HTTP 200, so an empty answer proves nothing and the "
+                "check for configuration copies the server runs was not run")
+            return out
+    for path in EXEC_CONTROL_PATHS:
+        no_redirect_status, _ = fetch_no_redirect(site + path)
+        status, _, body = fetch(site + path)
+        if status != 200:
+            continue
+        out.update(control_path=path, control_ran=True)
+        if not exec_copy_is_hit(status, no_redirect_status, body):
+            out["note"] = (
+                f"{path}, a core file that prints nothing when run, did not "
+                "answer with an empty HTTP 200, so the check for "
+                "configuration copies the server runs could not see a real "
+                "one and was not run")
+            return out
+        out["usable"] = True
+        return out
+    out["usable"] = True
+    out["note"] = ("no core control file answered (" +
+                   ", ".join(EXEC_CONTROL_PATHS) + "), so the check for "
+                   "configuration copies the server runs is unproven")
+    return out
+
+
 def _readme_probe(site: str, slug: str) -> Tuple[str, int]:
     """The Stable tag from a plugin's own readme.txt, and the HTTP status.
 
@@ -1843,16 +1934,46 @@ def collect_paths(ctx: RunContext) -> Tuple[str, int, str]:
                                     no_redirect_status),
             "error": hdrs.get("_error", ""),
         })
+    exec_cal: Dict = {}
+    if not (platform.get("decided") and not platform.get("wordpress")):
+        exec_cal = calibrate_exec(ctx.site)
+        ctx.write("exec_calibration", exec_cal)
+        for path, severity, why in EXEC_CONFIG_PATHS:
+            if shutdown_requested:
+                ctx.write("paths", rows)
+                return "partial", len(rows), "stopped by the operator"
+            row = {"path": path, "url": ctx.site + path, "severity": severity,
+                   "why": why, "rule": "exec-config", "status": 0,
+                   "no_redirect_status": 0, "location": "", "bytes": 0,
+                   "content_type": "", "exposed": False,
+                   "verdict": "not checked", "error": ""}
+            if exec_cal["usable"]:
+                no_redirect_status, nr_hdrs = fetch_no_redirect(row["url"])
+                status, hdrs, body = fetch(row["url"])
+                hit = exec_copy_is_hit(status, no_redirect_status, body)
+                row.update(
+                    status=status, no_redirect_status=no_redirect_status,
+                    location=nr_hdrs.get("location", ""), bytes=len(body),
+                    content_type=hdrs.get("content-type", ""), exposed=hit,
+                    error=hdrs.get("_error", ""),
+                    verdict=("runs, empty 200" if hit else
+                             path_verdict(path, status, body, False,
+                                          no_redirect_status)))
+            rows.append(row)
     ctx.write("paths", rows)
+    notes = []
     unanswered = [r for r in rows if r["verdict"] in ("no answer", "rate limited")]
     if unanswered:
         # A probe that never got an answer was not checked. Saying "ok" here
         # would let the appendix read those rows as clean.
-        return ("partial", len(rows),
-                f"{len(unanswered)} path(s) got no answer or were rate "
-                "limited, so they were not checked: "
-                + ", ".join(r["path"] for r in unanswered[:8])
-                + ("..." if len(unanswered) > 8 else ""))
+        notes.append(f"{len(unanswered)} path(s) got no answer or were rate "
+                     "limited, so they were not checked: "
+                     + ", ".join(r["path"] for r in unanswered[:8])
+                     + ("..." if len(unanswered) > 8 else ""))
+    if exec_cal.get("note"):
+        notes.append(exec_cal["note"])
+    if notes:
+        return "partial", len(rows), "; ".join(notes)
     return "ok", len(rows), ""
 
 
@@ -3098,8 +3219,12 @@ def check_paths(ctx: RunContext) -> List[Finding]:
     findings = []
     by_severity: Dict[str, List[Dict]] = {}
     empties: List[Dict] = []
+    exec_hits: List[Dict] = []
     for row in rows:
         if not row["exposed"]:
+            continue
+        if row.get("rule") == "exec-config":
+            exec_hits.append(row)
             continue
         if not row["bytes"] and not row["path"].endswith("/"):
             # A 0-byte 200 is a real file with nothing in it, or a server
@@ -3126,6 +3251,28 @@ def check_paths(ctx: RunContext) -> List[Finding]:
             [{"Path": r["path"], "Status": r["status"],
               "What it would be": r["why"]} for r in empties],
             "paths.json", len(empties)))
+
+    if exec_hits:
+        # MEDIUM, not CRITICAL: nothing was read, because PHP ran the file.
+        # Not LOW either: the copy holds credentials one server change away
+        # from being served, which outranks version disclosure.
+        findings.append(Finding(
+            "paths-config-copy", "MEDIUM",
+            f"{len(exec_hits)} old copy(ies) of the configuration file the "
+            "server runs",
+            "The server answered these names with HTTP 200 and an empty page, "
+            "while a made-up .php name on the same site answered differently. "
+            "That is what a copy of wp-config.php does when PHP runs it: it "
+            "holds the database password and the site's secret keys and "
+            "prints nothing. Nothing was read. The contents leak if PHP ever "
+            "stops handling the file.",
+            "Delete each copy from the server. If the database password in "
+            "it is still the live one, change it and the salts as well. "
+            "wp core verify-checksums lists stray files like these as \"File "
+            "should not exist\".",
+            [{"Path": h["path"], "Status": h["status"], "Bytes": h["bytes"],
+              "What it gives away": h["why"]} for h in exec_hits],
+            "paths.json", len(exec_hits)))
 
     for severity, hits in by_severity.items():
         evidence = [{"Path": h["path"], "Status": h["status"],
@@ -4493,7 +4640,8 @@ def _paths_appendix(ctx: RunContext) -> str:
         verdict = verdict.upper() if r["exposed"] else verdict
         cls = ("bad" if r["exposed"] else
                "warn-cell" if verdict in ("no answer", "rate limited",
-                                          "answered, unexpected content")
+                                          "answered, unexpected content",
+                                          "not checked")
                else "good")
         redirect = (f" (redirect {r['no_redirect_status']})"
                     if 300 <= (r["no_redirect_status"] or 0) < 400 else "")
@@ -4566,6 +4714,21 @@ def _methodology_block(ctx: RunContext) -> str:
         elif control.get("note"):
             lines.append(f"<p class='warn'><strong>Calibration control "
                          f"failed.</strong> {escape(control['note'])}</p>")
+
+    exec_cal = ctx.data("exec_calibration") or {}
+    if exec_cal.get("usable") and exec_cal.get("control_ran"):
+        lines.append(
+            "<p><strong>Configuration copies ending in .php were checked "
+            "differently.</strong> The server runs such a file rather than "
+            "sending it, so a real copy answers with an empty page. That "
+            "counted only because a made-up .php name on this site did not "
+            "answer the same way, and "
+            f"<code>{escape(exec_cal.get('control_path', ''))}</code>, a core "
+            "file that prints nothing when run, was still classified as "
+            "present.</p>")
+    elif exec_cal.get("note"):
+        lines.append("<p class='warn'><strong>Configuration copies ending in "
+                     f".php:</strong> {escape(exec_cal['note'])}.</p>")
 
     headers = ctx.data("headers") or {}
     if headers.get("edge"):
@@ -5546,6 +5709,101 @@ def selftest() -> int:
     rows, _ = _vuln_rows({"vulnerability": [loose]}, "4.9.8")
     check("sibling bound: an unbounded record alone still matches",
           len(rows), 1)
+
+    # 34. Config copies. A plain-text copy needs the config's content; a
+    #     copy ending in .php is run, not sent, so an empty 200 is the hit,
+    #     but only on a site where an unknown .php answers differently.
+    check("config copy: a plain-text wp-config.old is readable",
+          path_is_exposed("/wp-config.old", 200,
+                          "<?php\ndefine('DB_PASSWORD', 'x');", None, 200), True)
+    check("config copy: an HTML page at wp-config.bak is not the file",
+          path_is_exposed("/wp-config.bak", 200,
+                          "<!DOCTYPE html><html>DB_NAME</html>", None, 200), False)
+    check("config copy: an empty 200 is a run copy",
+          exec_copy_is_hit(200, 200, ""), True)
+    check("config copy: whitespace only is still empty",
+          exec_copy_is_hit(200, 200, "\n  \n"), True)
+    check("config copy: a soft 404 has a body",
+          exec_copy_is_hit(200, 200, "<h1>Page not found</h1>"), False)
+    check("config copy: a WAF page served 200 has a body",
+          exec_copy_is_hit(200, 200, "<title>Just a moment...</title>"), False)
+    check("config copy: a redirect to an empty page is not the file",
+          exec_copy_is_hit(200, 301, ""), False)
+    check("config copy: a 403 is not a hit", exec_copy_is_hit(403, 403, ""), False)
+
+    def fake_site(answer):
+        """fetch/fetch_no_redirect pair answering answer(path) -> (status, body)."""
+        def path_of(url):
+            return urllib.parse.urlparse(url).path
+        return ((lambda url, **kw: (answer(path_of(url))[0], {},
+                                    answer(path_of(url))[1])),
+                (lambda url, **kw: (answer(path_of(url))[0], {})))
+
+    real_files = {"/wp-load.php": "", "/wp-content/index.php": "",
+                  "/wp-includes/version.php": "",
+                  "/wp-config_old.php": "", "/robots.txt": "User-agent: *"}
+    denies_config = lambda p: ((403, "<h1>403 Forbidden</h1>") if p == "/wp-config.php.old"
+                        else (200, real_files[p]) if p in real_files
+                        else (404, "<h1>Not found</h1>"))
+    empty_everywhere = lambda p: (200, "")
+    soft_404 = lambda p: ((200, "") if p in real_files
+                          else (200, "<h1>Nothing found</h1>"))
+    no_control = lambda p: ((403, "denied") if p in EXEC_CONTROL_PATHS
+                            else denies_config(p))
+    control_has_body = lambda p: ((200, "Silence") if p == "/wp-load.php"
+                                  else denies_config(p))
+    g = globals()
+    saved = {k: g[k] for k in ("fetch", "fetch_no_redirect")}
+    try:
+        def run(site_fn):
+            g["fetch"], g["fetch_no_redirect"] = fake_site(site_fn)
+            with tempfile.TemporaryDirectory() as tmp:
+                ctx = RunContext(Path(tmp), argparse.Namespace(
+                    url=[], site="https://x.test"))
+                ctx.write("calibration", {"signature": {
+                    "status": site_fn("/zz.zip")[0], "no_redirect_status":
+                    site_fn("/zz.zip")[0], "redirects_unknown_paths": False,
+                    "stable": True, "fingerprint":
+                    body_fingerprint(site_fn("/zz.zip")[1], "zz.zip")},
+                    "control": {}})
+                status = collect_paths(ctx)[0]
+                found = {f.fid: f for f in check_paths(ctx)}
+                rows = {r["path"]: r for r in ctx.data("paths")}
+                return status, found, rows
+
+        status, found, rows = run(denies_config)
+        check("config copy: the empty-200 copy is reported MEDIUM",
+              (found.get("paths-config-copy") and
+               found["paths-config-copy"].severity,
+               len(found["paths-config-copy"].evidence)
+               if "paths-config-copy" in found else 0), ("MEDIUM", 1))
+        check("config copy: it is not also filed as an empty path",
+              "paths-empty" in found, False)
+        check("config copy: an absent copy reads not readable",
+              rows["/wp-config-old.php"]["verdict"], "not readable")
+        check("config copy: positive control proved, module ok",
+              status, "ok")
+
+        status, found, rows = run(empty_everywhere)
+        check("config copy: a site with an empty 200 for every path reports nothing",
+              "paths-config-copy" in found, False)
+        check("config copy: and says the check did not run",
+              (status, rows["/wp-config_old.php"]["verdict"]),
+              ("partial", "not checked"))
+
+        status, found, _ = run(soft_404)
+        check("config copy: a soft-404 site still finds the real copy",
+              "paths-config-copy" in found, True)
+
+        status, found, _ = run(control_has_body)
+        check("config copy: a failed positive control stands the rule down",
+              ("paths-config-copy" in found, status), (False, "partial"))
+
+        status, found, _ = run(no_control)
+        check("config copy: no control answering still reports, as partial",
+              ("paths-config-copy" in found, status), (True, "partial"))
+    finally:
+        g.update(saved)
 
     check("--delay is read as seconds",
           parse_args(["--delay", "2", "--selftest"]).delay, 2.0)

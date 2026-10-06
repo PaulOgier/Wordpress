@@ -241,6 +241,18 @@ challenge instead of the install form, is recorded as "answered, unexpected
 content" and never as readable. A 200 with an empty body is reported, but as
 its own INFO finding rather than in the severity table: nothing was read.
 
+Copies of `wp-config.php` whose names end in `.php` (`wp-config_old.php`,
+`wp-config-backup.php` and two others) are the exception. The server runs
+them instead of sending them, and a configuration file prints nothing, so a
+real copy answers HTTP 200 with an empty body; no content check can work.
+That empty 200 counts only after two made-up `.php` names on the same site,
+one of them shaped like `wp-config-*.php`, have answered differently, and
+after a core file that prints nothing when run (`wp-load.php`, then two
+fallbacks) has still been classified as present. A site that answers every
+unknown path with an empty 200 gets "not checked" for these paths, never a
+finding. A hit is MEDIUM: nothing was read, but the copy holds the database
+password and leaks it if PHP ever stops handling the file.
+
 If the site's not-found answer cannot be pinned down, path findings are
 reported as **unverified** with instructions for a human to settle them, rather
 than reported as real or silently dropped. Both of those are ways of lying
@@ -393,11 +405,13 @@ sitemap pages).
 python3 wp_audit.py --selftest
 ```
 
-Seventy-odd assertions against synthetic responses, no network. They cover the
+About 140 assertions against synthetic responses, no network. They cover the
 shapes that have each produced a wrong report: the redirecting site, the soft
 404 that echoes the requested path, the unstable 404 that cannot be
 calibrated, the installer that answers on every site, the WAF challenge page
-served with a 200, the empty directory, the real but empty file, the response
+served with a 200, the empty directory, the real but empty file, the
+configuration copy the server runs and the site that answers every path with
+an empty 200, the response
 that sets several cookies, the REST index larger than a page, the plugin that
 ships its own assets under several version strings, the HTML escaping of
 evidence rows, version ordering across 1.9 and 1.10, every vulnerability-range
