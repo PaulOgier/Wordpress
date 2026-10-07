@@ -215,7 +215,7 @@ from typing import Dict, List, Optional, Tuple
 # CONFIGURATION
 ###############################################################################
 
-SCRIPT_VERSION = "1.8.0"
+SCRIPT_VERSION = "1.9.0"
 
 # [OPTIONAL] Startup check against the remote VERSION file. Fail-silent.
 CHECK_FOR_UPDATES = True
@@ -1659,8 +1659,9 @@ def calibrate_exec(site: str) -> Dict:
     return out
 
 
-def _readme_probe(site: str, slug: str) -> Tuple[str, int]:
-    """The Stable tag from a plugin's own readme.txt, and the HTTP status.
+def _readme_probe(site: str, slug: str) -> Tuple[str, int, str]:
+    """The version from a plugin's own readme.txt, the HTTP status, and the
+    Stable tag when the changelog overrode it ("" otherwise).
 
     Independent of the page cache and of asset URLs, so it cross-checks the
     version read from ?ver= and supplies one where no asset carried it. It is
@@ -1677,9 +1678,22 @@ def _readme_probe(site: str, slug: str) -> Tuple[str, int]:
     status, _, body = fetch(f"{site}/wp-content/plugins/{slug}/readme.txt",
                             max_bytes=65_536)
     if status != 200 or "<html" in body[:2000].lower():
-        return "", status
+        return "", status, ""
     match = re.search(r"(?im)^\s*stable tag:\s*([0-9][0-9a-zA-Z.\-]*)\s*$", body)
-    return (match.group(1).strip() if match else ""), status
+    tag = match.group(1).strip() if match else ""
+    # The tag can lag the code it ships with: Forminator's own 1.57.3 release
+    # says "Stable tag: 1.57.2", which raised a false CRITICAL for a CVE fixed
+    # in 1.57.3. The newest changelog heading in the same file is the better
+    # witness when it is higher, but a changelog can also list a release
+    # that is not out yet, which would clear a vulnerable plugin. So the old
+    # tag is returned as well, and check_vulns reports what it would match.
+    log = re.split(r"(?im)^\s*==\s*changelog\s*==\s*$", body, maxsplit=1)
+    if len(log) == 2:
+        heads = re.findall(r"(?m)^\s*=+\s*v?(\d+(?:\.\d+)+)\b", log[1])
+        newest = max(heads, key=version_key, default="")
+        if newest and version_key(newest) > version_key(tag):
+            return newest, status, tag
+    return tag, status, ""
 
 
 def _readme_stable_tag(site: str, slug: str) -> str:
@@ -2199,9 +2213,10 @@ def collect_rest(ctx: RunContext) -> Tuple[str, int, str]:
         name, slug = NAMESPACE_PLUGINS.get(ns, (ns, None))
         if not slug or slug in namespace_plugins:
             continue
-        tag, readme_status = _readme_probe(ctx.site, slug)
+        tag, readme_status, lagging = _readme_probe(ctx.site, slug)
         namespace_plugins[slug] = {"name": name, "namespace": ns,
                                    "readme_version": tag,
+                                   "readme_stable_tag": lagging,
                                    "readme_status": readme_status}
     ctx.write("rest", {
         "name": data.get("name", ""),
@@ -2578,8 +2593,9 @@ def collect_assets(ctx: RunContext) -> Tuple[str, int, str]:
     for slug, entry in plugins.items():
         if shutdown_requested:
             break
-        tag, readme_status = _readme_probe(ctx.site, slug)
+        tag, readme_status, lagging = _readme_probe(ctx.site, slug)
         entry["readme_version"] = tag
+        entry["readme_stable_tag"] = lagging
         entry["readme_status"] = readme_status
         if tag and not entry["versions"]:
             entry["versions"][tag] = 0
@@ -2591,6 +2607,7 @@ def collect_assets(ctx: RunContext) -> Tuple[str, int, str]:
         "plugins": {slug: {
             "versions": sorted(v["versions"]),
             "readme_version": v.get("readme_version", ""),
+            "readme_stable_tag": v.get("readme_stable_tag", ""),
             "readme_status": v.get("readme_status", 0),
             "pages": v["pages"],
         } for slug, v in sorted(plugins.items())},
@@ -2679,6 +2696,7 @@ def collect_vulns(ctx: RunContext) -> Tuple[str, int, str]:
         tag = info.get("readme_version", "")
         plugins[slug] = {"versions": [tag] if tag else [], "pages": 0,
                          "readme_version": tag,
+                         "readme_stable_tag": info.get("readme_stable_tag", ""),
                          "readme_status": info.get("readme_status", 0),
                          "source": "rest namespace"}
     theme_slugs = headers.get("theme", []) or []
@@ -2745,6 +2763,7 @@ def collect_vulns(ctx: RunContext) -> Tuple[str, int, str]:
         versions = [v for v in info.get("versions", []) if version_ordered(v)]
         entry: Dict = {"detected_versions": info.get("versions", []),
                        "readme_version": info.get("readme_version", ""),
+                       "readme_stable_tag": info.get("readme_stable_tag", ""),
                        "readme_status": info.get("readme_status", 0),
                        "source": info.get("source", "assets"),
                        "pages": info.get("pages", 0)}
@@ -2783,6 +2802,17 @@ def collect_vulns(ctx: RunContext) -> Tuple[str, int, str]:
         entry["vulnerabilities"] = sorted(matched, key=lambda r: r["score"],
                                           reverse=True)
         entry["undecidable"] = undecidable
+        # The changelog raised the version above the readme's Stable tag.
+        # Whatever the old tag would match and the running version does not
+        # is reported as disputed, so the higher reading cannot hide it.
+        lagging = entry["readme_stable_tag"]
+        if lagging and version_ordered(lagging):
+            seen = {r.get("cve") or r.get("name") for r in matched}
+            at_tag, _ = _vuln_rows(lookup["record"], lagging)
+            entry["disputed_vulnerabilities"] = sorted(
+                (dict(r, affected_version=lagging) for r in at_tag
+                 if (r.get("cve") or r.get("name")) not in seen),
+                key=lambda r: r["score"] or 0, reverse=True)
         data["plugins"][slug] = entry
 
     # Themes. The homepage names the theme directory; style.css, read by the
@@ -4002,6 +4032,34 @@ def check_vulns(ctx: RunContext) -> List[Finding]:
             "rather than a cached page. Where no fix is published, the plugin "
             "has to be deactivated and removed until one is, or replaced.",
             rows, "vulns.json", len(vulnerable)))
+
+    # 1b. Version read from the changelog over a lower Stable tag. MEDIUM, not
+    #     the CVE's own score: the higher reading is usually right (Forminator
+    #     1.57.3 shipped saying 1.57.2), but only the Plugins screen settles it.
+    disputed = {s: e for s, e in plugins.items()
+                if e.get("disputed_vulnerabilities")}
+    if disputed:
+        findings.append(Finding(
+            "vulns-disputed", "MEDIUM",
+            f"{len(disputed)} plugin(s) are vulnerable only if their readme's "
+            "Stable tag is right",
+            "The plugin's readme.txt names one version on its Stable tag line "
+            "and a higher one at the top of its changelog. The check above used "
+            "the changelog, because authors forget to bump the tag. A changelog "
+            "can also list a release that is not installed, so these "
+            "vulnerabilities apply if the Stable tag is the true version.",
+            "Read the version in Plugins > Installed Plugins (or the dashboard "
+            "that manages the site). At or above the changelog version, nothing "
+            "to do; at the Stable tag version, update to the fixed release.",
+            [{"Plugin": s,
+              "Stable tag": e["readme_stable_tag"],
+              "Changelog": e.get("readme_version", ""),
+              "Issues at the Stable tag": len(e["disputed_vulnerabilities"]),
+              "Reference": (e["disputed_vulnerabilities"][0].get("cve")
+                            or e["disputed_vulnerabilities"][0].get("name", "")[:60]),
+              "Fixed in": e["disputed_vulnerabilities"][0].get("fixed_in", "")}
+             for s, e in sorted(disputed.items())],
+            "vulns.json", len(disputed)))
 
     # 2. Withdrawn from the directory. No vulnerability database needed.
     #
@@ -5493,6 +5551,17 @@ def selftest() -> int:
     try:
         globals()["fetch"] = lambda *a, **k: (200, {}, "=== X ===\nStable tag: 4.2.1\n")
         check("stable tag is read", _readme_stable_tag("https://x", "p"), "4.2.1")
+        globals()["fetch"] = lambda *a, **k: (200, {}, (
+            "Stable tag: 1.57.2\n== Changelog ==\n= 1.57.3 ( 2026-09-17 ) =\n"
+            "= 1.57.2.1 ( 2026-09-17 ) =\n= 1.57.2 ( 2026-08-27 ) =\n"))
+        check("a changelog newer than the stable tag wins (Forminator 1.57.3)",
+              _readme_stable_tag("https://x", "p"), "1.57.3")
+        check("the overridden stable tag is kept for the disputed check",
+              _readme_probe("https://x", "p"), ("1.57.3", 200, "1.57.2"))
+        globals()["fetch"] = lambda *a, **k: (200, {}, (
+            "Stable tag: 4.2.1\n== Changelog ==\n= 4.2.1 =\n= 4.2.0 =\n"))
+        check("an older changelog never lowers the stable tag",
+              _readme_stable_tag("https://x", "p"), "4.2.1")
         globals()["fetch"] = lambda *a, **k: (200, {}, "Stable tag: trunk\n")
         check("trunk is not a version", _readme_stable_tag("https://x", "p"), "")
         globals()["fetch"] = lambda *a, **k: (200, {}, "<html>soft 404</html>")
@@ -5503,7 +5572,7 @@ def selftest() -> int:
               (style["version"], style["parent"]), ("1.2.3", "bar"))
         globals()["fetch"] = lambda *a, **k: (403, {}, "<html>blocked</html>")
         check("a WAF block is reported as its status, not as an absent readme",
-              _readme_probe("https://x", "p"), ("", 403))
+              _readme_probe("https://x", "p"), ("", 403, ""))
     finally:
         globals()["fetch"] = real_fetch2
 
