@@ -42,8 +42,8 @@ jurisdictions. See "Safety posture" below for what this does and does not do.
 
 Author:       Paul Ogier
 Created:      2026-09-03
-Updated:      2026-09-03
-Version:      1.2.0
+Updated:      2026-10-21
+Version:      1.10.0
 Status:       Production
 Python:       3.9+
 Dependencies: Stdlib only. `dig` is used for DNS when present, with a
@@ -75,8 +75,8 @@ Safety posture
 --------------
 Every request is a GET or a HEAD. There is no POST, no form submission, no
 password guessing, no injection payload, no load testing, and nothing behind
-a login. A full run is a few hundred ordinary page fetches, which is safe
-against production and inside the terms of hosts that forbid load testing.
+a login. A full run is a few hundred ordinary page fetches. The one that
+does work on the server is wp-cron.php, which runs any scheduled tasks due.
 
 This is NOT a penetration test. It cannot find injection flaws, broken
 access control behind a login, or anything that needs a request this tool
@@ -215,7 +215,7 @@ from typing import Dict, List, Optional, Tuple
 # CONFIGURATION
 ###############################################################################
 
-SCRIPT_VERSION = "1.9.0"
+SCRIPT_VERSION = "1.10.0"
 
 # [OPTIONAL] Startup check against the remote VERSION file. Fail-silent.
 CHECK_FOR_UPDATES = True
@@ -356,10 +356,8 @@ INSTALLER_MARKERS = ("weblog_title", "language-chooser", "information needed",
 # table. Archives are checked by their first bytes in content_matches().
 # Paths not listed here keep the plain 200 rule.
 CONTENT_MARKERS: Dict[str, Tuple[str, ...]] = {
-    "/.env": ("=",),
     "/.git/config": ("[core]", "repositoryformatversion"),
     "/.git/HEAD": ("ref:", "refs/"),
-    "/.htpasswd": (":",),
     "/.aws/credentials": ("aws_access_key_id", "aws_secret_access_key"),
     "/id_rsa": ("private key",),
     "/.user.ini": ("=",),
@@ -1065,8 +1063,23 @@ def version_key(version: str) -> Tuple[Tuple[int, ...], int]:
                     if part.isdigit())
     if not numbers:
         return ((-1,), 0)
-    numbers = (numbers + (0, 0, 0, 0))[:4]
-    return (numbers, -1 if match.group(2).strip() else 0)
+    while len(numbers) > 1 and numbers[-1] == 0:
+        numbers = numbers[:-1]
+    # Build metadata (+...) is not a prerelease and does not order.
+    suffix = match.group(2).split("+", 1)[0].strip().lower()
+    return (numbers, _prerelease_rank(suffix))
+
+
+def _prerelease_rank(suffix: str) -> int:
+    """0 for a release, below zero for a prerelease: alpha < beta < rc, each
+    by its number. An unrecognised suffix sorts below every known one."""
+    if not suffix:
+        return 0
+    match = re.fullmatch(r"[-_.]?(alpha|a|beta|b|rc)[-_.]?(\d*)", suffix)
+    if not match:
+        return -40000
+    stage = {"alpha": 3, "a": 3, "beta": 2, "b": 2, "rc": 1}[match.group(1)]
+    return -stage * 10000 + int(match.group(2) or 0)
 
 
 def version_ordered(version: str) -> bool:
@@ -1485,6 +1498,13 @@ def content_matches(path: str, body: str) -> Optional[bool]:
         return body.startswith("\x1f")
     if path.endswith(".sql"):
         return any(m in low for m in SQL_MARKERS)
+    # One "=" or ":" anywhere passed a challenge page ("token=abc") and an
+    # error line ("Access denied: retry") as credentials. The file's shape
+    # is a line: NAME=value, or user:hash.
+    if path == "/.env":
+        return bool(re.search(r"(?m)^[ \t]*(export[ \t]+)?[A-Za-z_][A-Za-z0-9_]*[ \t]*=", body))
+    if path == "/.htpasswd":
+        return bool(re.search(r"(?m)^[^:\s<>]+:[^\s:<>]{13,}[ \t]*$", body))
     markers = CONTENT_MARKERS.get(path)
     if markers is None:
         # No rule, but a bare HTML document at a non-HTML path is still not
@@ -1606,6 +1626,14 @@ def exec_copy_is_hit(status: int, no_redirect_status: Optional[int],
     unknown .php the same way.
     """
     return status == 200 and no_redirect_status == 200 and not body.strip()
+
+
+def config_source_leaked(status: int, body: str) -> bool:
+    """Is this the text of a wp-config.php, not its output? Two of the
+    defines it cannot run without, so a page mentioning one does not pass."""
+    low = body.lower()
+    return (status == 200 and "<?php" in low
+            and "db_password" in low and "db_name" in low)
 
 
 def calibrate_exec(site: str) -> Dict:
@@ -1965,6 +1993,7 @@ def collect_paths(ctx: RunContext) -> Tuple[str, int, str]:
                 no_redirect_status, nr_hdrs = fetch_no_redirect(row["url"])
                 status, hdrs, body = fetch(row["url"])
                 hit = exec_copy_is_hit(status, no_redirect_status, body)
+                leaked = config_source_leaked(status, body)
                 row.update(
                     status=status, no_redirect_status=no_redirect_status,
                     location=nr_hdrs.get("location", ""), bytes=len(body),
@@ -1973,6 +2002,18 @@ def collect_paths(ctx: RunContext) -> Tuple[str, int, str]:
                     verdict=("runs, empty 200" if hit else
                              path_verdict(path, status, body, False,
                                           no_redirect_status)))
+            else:
+                status, hdrs, body = fetch(row["url"])
+                leaked = config_source_leaked(status, body)
+            # PHP not running the file serves its source: the credentials
+            # themselves. Content decides, so no calibration is needed.
+            if leaked:
+                row.update(status=status, bytes=len(body), exposed=True,
+                           severity="CRITICAL", rule="config-source",
+                           content_type=hdrs.get("content-type", ""),
+                           verdict="readable",
+                           why="The configuration source is served as text: "
+                               "database password and salts.")
             rows.append(row)
     ctx.write("paths", rows)
     notes = []
@@ -2004,13 +2045,8 @@ def collect_headers(ctx: RunContext) -> Tuple[str, int, str]:
     for chunk in hdrs.get("set-cookie", "").split("\n"):
         if "=" not in chunk:
             continue
-        low = chunk.lower()
-        cookies.append({
-            "name": chunk.split("=", 1)[0].strip(),
-            "secure": "secure" in low,
-            "httponly": "httponly" in low,
-            "samesite": "samesite" in low,
-        })
+        cookies.append(dict(name=chunk.split("=", 1)[0].strip(),
+                            **cookie_flags(chunk)))
     generators = re.findall(r'<meta name="generator" content="([^"]+)"', body)
 
     # Core version, from every free source, because the generator tag is the
@@ -2430,8 +2466,12 @@ def previous_documents(run_dir: Path) -> Tuple[str, List[Dict]]:
     return "", []
 
 
-def _check_document(url: str, library: set) -> Dict:
-    """HEAD one document URL (GET for one byte where HEAD is refused)."""
+def _check_document(url: str, library: Optional[set]) -> Dict:
+    """HEAD one document URL (GET for one byte where HEAD is refused).
+
+    library is None when the media walk did not complete: absence from an
+    incomplete walk is not absence from the library, so in_library is None.
+    """
     status, hdrs, _ = fetch(url, method="HEAD")
     if status in (405, 501):
         # Some hosts refuse HEAD. A GET capped at one byte of body is
@@ -2442,7 +2482,8 @@ def _check_document(url: str, library: set) -> Dict:
         "status": status,
         "bytes": hdrs.get("content-length", ""),
         "content_type": hdrs.get("content-type", ""),
-        "in_library": url.split("?")[0] in library,
+        "in_library": (None if library is None
+                       else url.split("?")[0] in library),
         "sensitive": sensitive_hits(urllib.parse.urlparse(url).path.lower()),
     }
 
@@ -2462,7 +2503,9 @@ def collect_documents(ctx: RunContext) -> Tuple[str, int, str]:
     forward; one that no longer does is reported as removed, never dropped.
     """
     media = ctx.data("media") or {}
-    library = {u.split("?")[0] for u in media.get("all_urls", [])}
+    library = ({u.split("?")[0] for u in media.get("all_urls", [])}
+               if ctx.module_status("media") == "ok" and ctx.data("media")
+               else None)
     candidates = [d["url"] for d in media.get("documents", [])]
     # --url is a command-line flag, so a resumed run would otherwise drop the
     # extras and quietly produce different findings from the same run
@@ -2500,9 +2543,10 @@ def collect_documents(ctx: RunContext) -> Tuple[str, int, str]:
         if row["status"] == 200:
             row["carried_from"] = prev_run
             carried += 1
-        elif row["status"] == 0:
-            # A failed request says nothing about the file. Keep it so the
-            # next run asks again, but it is not reported as removed.
+        elif row["status"] not in (404, 410):
+            # A failed request, a 429, a 403 or a 5xx says nothing about
+            # whether the file is still there. Keep it so the next run asks
+            # again, but it is not reported as removed.
             row["carried_from"] = prev_run
             unmeasured += 1
         else:
@@ -2520,6 +2564,8 @@ def collect_documents(ctx: RunContext) -> Tuple[str, int, str]:
                    f"{carried} carried forward from {prev_run}, {removed} "
                    f"removed since, {unmeasured} unmeasured (request failed)")
     ctx.write("documents", rows)
+    if shutdown_requested:
+        return "partial", len(rows), "stopped by the operator"
     return "ok", len(rows), ""
 
 
@@ -2538,7 +2584,9 @@ def collect_assets(ctx: RunContext) -> Tuple[str, int, str]:
     one page understated the public surface of a vulnerable plugin by a
     factor of forty on a live site.
     """
-    urls = _sitemap_urls(ctx.site)[:ASSET_MAX_PAGES]
+    listed = _sitemap_urls(ctx.site)
+    # Counted before the cap, or a 120-page sitemap read as "80 of 80".
+    urls = listed[:ASSET_MAX_PAGES]
     if not urls:
         urls = [ctx.site + "/"]
     plugins: Dict[str, Dict] = {}
@@ -2566,7 +2614,9 @@ def collect_assets(ctx: RunContext) -> Tuple[str, int, str]:
         # installed. Recording the slug with no version keeps it in the
         # inventory and keeps it eligible for the currency and withdrawal
         # checks, which need no version at all.
-        for slug, _version in found:
+        # A path with no ?ver= at all is the same evidence of an install.
+        bare = set(re.findall(r"/wp-content/plugins/([^/\"'?#]+)/", body))
+        for slug in bare | {s for s, _ in found}:
             plugins.setdefault(slug, {"versions": {}, "pages": 0})
         for slug, version in found:
             # A hash-shaped "version" is a cache-buster, not a release. So is
@@ -2580,7 +2630,7 @@ def collect_assets(ctx: RunContext) -> Tuple[str, int, str]:
             entry = plugins.setdefault(slug, {"versions": {}, "pages": 0})
             entry["versions"].setdefault(version, 0)
             entry["versions"][version] += 1
-        for slug in {s for s, _ in found}:
+        for slug in bare | {s for s, _ in found}:
             plugins[slug]["pages"] += 1
         page_rows.append({
             "url": url,
@@ -2601,7 +2651,7 @@ def collect_assets(ctx: RunContext) -> Tuple[str, int, str]:
             entry["versions"][tag] = 0
     data = {
         "pages_checked": len(page_rows),
-        "pages_in_sitemap": len(urls),
+        "pages_in_sitemap": len(listed),
         "pages_failed": failed,
         "cache_states": sorted({r["cache"] for r in page_rows if r["cache"]}),
         "plugins": {slug: {
@@ -2626,7 +2676,13 @@ def collect_assets(ctx: RunContext) -> Tuple[str, int, str]:
                      "answer 200 and were not read ("
                      + ", ".join(f"HTTP {s} x{n}" for s, n in sorted(failed.items()))
                      + ")")
+    if len(listed) > len(urls):
+        notes.append(f"the sitemap lists {len(listed)} pages; the first "
+                     f"{ASSET_MAX_PAGES} were read")
     status = "partial" if failed and sum(failed.values()) * 4 > len(urls) else "ok"
+    if shutdown_requested:
+        notes.append("stopped by the operator")
+        status = "partial"
     return status, len(page_rows), "; ".join(notes)
 
 
@@ -2642,7 +2698,7 @@ def _sitemap_urls(site: str) -> List[str]:
             # Prefer page sitemaps: they are where forms and plugin assets
             # live. Post archives add hundreds of URLs and little signal.
             children = sorted(locs, key=lambda u: (0 if "page" in u else 1, u))
-            for child in children[:6]:
+            for child in [u for u in children if _in_scope(u, site)][:6]:
                 s2, _, b2 = fetch(child)
                 if s2 == 200:
                     out.extend(re.findall(r"<loc>\s*([^<\s]+)\s*</loc>", b2))
@@ -2653,10 +2709,21 @@ def _sitemap_urls(site: str) -> List[str]:
     seen = set()
     unique = []
     for u in out:
-        if u not in seen and not u.endswith((".xml", ".jpg", ".png")):
+        if (u not in seen and not u.endswith((".xml", ".jpg", ".png"))
+                and _in_scope(u, site)):
             seen.add(u)
             unique.append(u)
     return unique
+
+
+def _in_scope(url: str, site: str) -> bool:
+    """Is a URL the site published one this audit may request? Same host,
+    with or without www., over http(s). A sitemap is the site's own content,
+    and one pointing at 127.0.0.1 would have had this tool fetch it."""
+    parsed = urllib.parse.urlparse(url)
+    return (parsed.scheme in ("http", "https")
+            and re.sub(r"^www\.", "", parsed.netloc.lower())
+            == re.sub(r"^www\.", "", urllib.parse.urlparse(site).netloc.lower()))
 
 
 def collect_vulns(ctx: RunContext) -> Tuple[str, int, str]:
@@ -2699,8 +2766,18 @@ def collect_vulns(ctx: RunContext) -> Tuple[str, int, str]:
                          "readme_stable_tag": info.get("readme_stable_tag", ""),
                          "readme_status": info.get("readme_status", 0),
                          "source": "rest namespace"}
-    theme_slugs = headers.get("theme", []) or []
+    # Named in the homepage HTML but absent from the sweep (assets skipped
+    # or the sitemap missed the homepage): still installed, still checked.
+    for slug in headers.get("homepage_plugins", []) or []:
+        plugins.setdefault(slug, {"versions": [], "pages": 0,
+                                  "source": "homepage"})
     theme_info = headers.get("theme_info", {}) or {}
+    theme_slugs = list(headers.get("theme", []) or [])
+    # A child theme runs its parent's code, so the parent is checked too.
+    for info in list(theme_info.values()):
+        parent = (info or {}).get("parent", "")
+        if parent and parent not in theme_slugs:
+            theme_slugs.append(parent)
 
     data: Dict = {
         "checked_at": datetime.now().isoformat(timespec="seconds"),
@@ -2741,10 +2818,14 @@ def collect_vulns(ctx: RunContext) -> Tuple[str, int, str]:
                   "majors": sorted({".".join(v.split(".")[:2])
                                     for v in releases if version_ordered(v)},
                                    key=version_key)}
-    if detected_core and latest_core and version_ordered(detected_core):
+    # The release list and the vulnerability feed are separate services. An
+    # api.wordpress.org outage used to skip the CVE lookup as well.
+    if detected_core and version_ordered(detected_core):
         floor = version_key(detected_core)
-        core["releases_behind"] = sum(
-            1 for v in releases if version_ordered(v) and version_key(v) > floor)
+        if latest_core:
+            core["releases_behind"] = sum(
+                1 for v in releases
+                if version_ordered(v) and version_key(v) > floor)
         lookup = _wpvuln("core", detected_core)
         core["covered"] = lookup["covered"]
         core["lookup_error"] = lookup["error"]
@@ -2806,6 +2887,12 @@ def collect_vulns(ctx: RunContext) -> Tuple[str, int, str]:
         # Whatever the old tag would match and the running version does not
         # is reported as disputed, so the higher reading cannot hide it.
         lagging = entry["readme_stable_tag"]
+        # A readme.txt below the highest asset version is the other witness:
+        # a bundled library's ver= can sit above the plugin's own release.
+        if (not lagging and readme and version_ordered(readme)
+                and entry["version_running"]
+                and version_key(readme) < version_key(entry["version_running"])):
+            lagging = readme
         if lagging and version_ordered(lagging):
             seen = {r.get("cve") or r.get("name") for r in matched}
             at_tag, _ = _vuln_rows(lookup["record"], lagging)
@@ -2859,6 +2946,8 @@ def collect_vulns(ctx: RunContext) -> Tuple[str, int, str]:
         return "empty", 0, ("nothing to look up: no plugin or theme was "
                             "identified, usually because the assets module "
                             "was skipped")
+    if shutdown_requested:
+        return "partial", rows, "stopped by the operator"
     return "ok", rows, note
 
 
@@ -2916,25 +3005,29 @@ def _currency(url: str, versions: List[str]) -> Dict:
 
 def collect_transport(ctx: RunContext) -> Tuple[str, int, str]:
     """HTTP-to-HTTPS behaviour, TLS, CORS, XML-RPC and security.txt."""
-    host = urllib.parse.urlparse(ctx.site).netloc
+    parsed = urllib.parse.urlparse(ctx.site)
+    host = parsed.netloc
     data: Dict = {"host": host}
 
-    http_status, http_hdrs = fetch_no_redirect("http://" + host + "/")
+    http_status, http_hdrs = fetch_no_redirect("http://" + parsed.hostname + "/")
     data["http"] = {"status": http_status,
                     "location": http_hdrs.get("location", "")}
 
-    data["tls"] = _tls_info(host)
+    data["tls"] = (_tls_info(parsed.hostname, parsed.port or 443)
+                   if parsed.scheme == "https" else {"error": "site is not HTTPS"})
 
     _, cors_hdrs, _ = fetch(ctx.site + "/wp-json/")
     data["cors"] = cors_hdrs.get("access-control-allow-origin", "")
 
     # XML-RPC without a POST: GET returns a one-line refusal when the
-    # endpoint is live and a 403/404 when it is blocked. Listing the
-    # available methods would need system.listMethods, which is a POST.
+    # endpoint is live and a 403/404 when it is blocked. WordPress sends that
+    # refusal with a 405 (WP #20986), so requiring a 200 read every stock
+    # install as blocked. Listing the available methods would need
+    # system.listMethods, which is a POST.
     status, _, body = fetch(ctx.site + "/xmlrpc.php")
     data["xmlrpc"] = {
         "status": status,
-        "answering": status == 200 and "xml-rpc server accepts" in body.lower(),
+        "answering": xmlrpc_answering(status, body),
     }
 
     status, _, body = fetch(ctx.site + "/.well-known/security.txt")
@@ -2961,7 +3054,34 @@ def collect_transport(ctx: RunContext) -> Tuple[str, int, str]:
                       "disallow": re.findall(r"(?im)^disallow:\s*(\S+)", body)[:40]}
 
     ctx.write("transport", data)
-    return "ok", 1, ""
+    probes = [http_status, data["xmlrpc"]["status"], data["wp_cron"]["status"],
+              data["robots"]["status"], data["security_txt"]["status"]]
+    if not any(probes) and data["tls"].get("error"):
+        return "error", 0, "no request got an answer"
+    notes = []
+    if probes.count(0):
+        notes.append(f"{probes.count(0)} of {len(probes)} requests got no answer")
+    if data["tls"].get("error") and not data["tls"].get("verify_error"):
+        notes.append("TLS not measured: " + data["tls"]["error"])
+    return ("partial" if notes else "ok"), 1, "; ".join(notes)
+
+
+def xmlrpc_answering(status: int, body: str) -> bool:
+    """Is xmlrpc.php the live WordPress endpoint? Its GET refusal names
+    itself; a bare 405 from a WAF does not."""
+    return status in (200, 405) and "xml-rpc server accepts" in body.lower()
+
+
+def cookie_flags(set_cookie: str) -> Dict[str, bool]:
+    """Secure, HttpOnly and SameSite as attributes of one Set-Cookie line.
+
+    Only the parts after the first ';' are attributes. Searching the whole
+    line let a value such as session=secure-httponly pass for both flags.
+    """
+    attrs = {part.split("=", 1)[0].strip().lower()
+             for part in set_cookie.split(";")[1:]}
+    return {"secure": "secure" in attrs, "httponly": "httponly" in attrs,
+            "samesite": "samesite" in attrs}
 
 
 def security_txt_present(status: int, body: str) -> bool:
@@ -2977,13 +3097,19 @@ def security_txt_present(status: int, body: str) -> bool:
                           r"acknowledgments|acknowledgements):", body))
 
 
-def _tls_info(host: str) -> Dict:
+def _tls_info(host: str, port: int = 443) -> Dict:
     """Certificate issuer, expiry and negotiated protocol. Read-only
-    handshake, no data sent beyond the TLS ClientHello."""
+    handshake, no data sent beyond the TLS ClientHello.
+
+    A certificate that fails verification (expired, wrong name, untrusted)
+    never completes the handshake, so it has no expiry to read. It is kept
+    as verify_error, which is a measurement, apart from a connection that
+    failed, which is not.
+    """
     out: Dict = {}
     try:
         context = ssl.create_default_context()
-        with socket.create_connection((host, 443), timeout=10) as sock:
+        with socket.create_connection((host, port), timeout=10) as sock:
             with context.wrap_socket(sock, server_hostname=host) as tls:
                 out["protocol"] = tls.version()
                 cert = tls.getpeercert() or {}
@@ -2991,11 +3117,20 @@ def _tls_info(host: str) -> Dict:
         out["issuer"] = issuer.get("organizationName", "?")
         out["expires"] = cert.get("notAfter", "")
         if out["expires"]:
-            expiry = datetime.strptime(out["expires"], "%b %d %H:%M:%S %Y %Z")
-            out["days_left"] = (expiry - datetime.now()).days
+            out.update(_tls_time_left(out["expires"], time.time()))
+    except ssl.SSLCertVerificationError as exc:
+        out["error"] = f"{type(exc).__name__}: {exc}"
+        out["verify_error"] = exc.verify_message or str(exc)
     except Exception as exc:
         out["error"] = f"{type(exc).__name__}: {exc}"
     return out
+
+
+def _tls_time_left(not_after: str, now: float) -> Dict:
+    """Seconds and whole days to a certificate's notAfter, both in UTC. A
+    certificate that lapses later today has 0 days left but is not expired."""
+    seconds = int(ssl.cert_time_to_seconds(not_after) - now)
+    return {"seconds_left": seconds, "days_left": seconds // 86400}
 
 
 def collect_dns(ctx: RunContext) -> Tuple[str, int, str]:
@@ -3171,7 +3306,12 @@ def collect(ctx: RunContext, modules: List[Dict]):
                            "left out of this run with --skip or --only")
     for mod in modules:
         key = mod["key"]
-        if ctx.module_status(key) == "ok" and not ctx.args.force:
+        # "ok" is only trusted with a readable file behind it, and documents
+        # re-runs when this invocation names a --url it has not checked.
+        new_urls = (key == "documents" and set(ctx.args.url or [])
+                    - set(ctx.manifest["meta"].get("extra_urls", [])))
+        if (ctx.module_status(key) == "ok" and not ctx.args.force
+                and ctx.data(key) is not None and not new_urls):
             print_info(f"{key}: already collected, skipping "
                        "(use --force to redo)")
             continue
@@ -3234,7 +3374,9 @@ class Finding:
         self.title = title
         self.meaning = meaning
         self.remediation = remediation
-        self.evidence = evidence[:EVIDENCE_ROWS]
+        # Kept whole; _evidence_table() caps what the page shows.
+        # findings.json promised every row and carried twelve.
+        self.evidence = list(evidence)
         self.count = count if count is not None else len(evidence)
         self.source = source
 
@@ -3650,9 +3792,13 @@ def check_documents(ctx: RunContext) -> List[Finding]:
     if not rows:
         return []
     findings = []
-    live = [r for r in rows if r["status"] == 200]
+    # A PDF URL that redirects to the homepage ends on a 200 HTML page.
+    live = [r for r in rows if r["status"] == 200
+            and not (r.get("content_type", "").startswith("text/html")
+                     and not urllib.parse.urlparse(r["url"]).path.endswith(
+                         (".html", ".htm")))]
 
-    orphans = [r for r in live if not r["in_library"]]
+    orphans = [r for r in live if r["in_library"] is False]
     if orphans:
         findings.append(Finding(
             "docs-orphan", "MEDIUM",
@@ -3675,8 +3821,22 @@ def check_documents(ctx: RunContext) -> List[Finding]:
               else "this run"}
              for r in orphans], "documents.json", len(orphans)))
 
+    unknown = [r for r in live if r["in_library"] is None]
+    if unknown:
+        findings.append(Finding(
+            "docs-library-unknown", "INFO",
+            f"{len(unknown)} downloadable document(s) could not be compared "
+            "against the media library",
+            "The media walk did not complete, so absence from it would not "
+            "show that a file is missing from the library. These may be "
+            "orphans or may be listed normally; this run cannot tell.",
+            "Re-run once the media module completes, or compare these URLs "
+            "against the Media screen by hand.",
+            [{"URL": r["url"], "Bytes": r["bytes"]} for r in unknown],
+            "documents.json", len(unknown)))
+
     sensitive = [r for r in live if r["sensitive"]]
-    hidden_sensitive = [r for r in sensitive if not r["in_library"]]
+    hidden_sensitive = [r for r in sensitive if r["in_library"] is False]
     if hidden_sensitive:
         findings.append(Finding(
             "docs-hidden-sensitive", "HIGH",
@@ -3715,7 +3875,8 @@ def check_documents(ctx: RunContext) -> List[Finding]:
             "never have been public, assume it was downloaded and treat the "
             "contents accordingly.",
             [{"URL": r["url"], "Flagged words": ", ".join(r["sensitive"]),
-              "In library": "yes" if r["in_library"] else "NO",
+              "In library": {True: "yes", False: "NO"}.get(
+                  r["in_library"], "not known (media walk incomplete)"),
               "Bytes": r["bytes"]} for r in sensitive],
             "documents.json", len(sensitive)))
 
@@ -3726,8 +3887,8 @@ def check_documents(ctx: RunContext) -> List[Finding]:
             f"{len(removed)} document(s) found on an earlier run no longer "
             "resolve",
             "Each of these answered 200 on the earlier run named beside it "
-            "and does not now. That is the evidence that a file was actually "
-            "removed, rather than missed by this run's discovery.",
+            "and now answers 404 or 410. The file no longer resolves "
+            "publicly; that is not proof it was deleted from disk.",
             "Nothing to do if the removal was intended. If a search engine "
             "still lists the URL, a removal request in Google Search Console "
             "clears it faster.",
@@ -3735,8 +3896,8 @@ def check_documents(ctx: RunContext) -> List[Finding]:
               "Last seen on run": r["removed_since"]} for r in removed],
             "documents.json", len(removed)))
 
-    dead = [r for r in rows
-            if r["status"] not in (200, 0) and not r.get("removed_since")]
+    dead = [r for r in rows if r["status"] in (404, 410)
+            and not r.get("removed_since") and not r.get("carried_from")]
     if dead:
         findings.append(Finding(
             "docs-dead", "INFO",
@@ -3952,7 +4113,10 @@ def check_vulns(ctx: RunContext) -> List[Finding]:
         return []
     findings: List[Finding] = []
     plugins = data.get("plugins", {})
-    themes = data.get("themes", {})
+    # A theme may share a plugin's slug, and {**plugins, **themes} dropped the
+    # plugin, its advisories with it.
+    themes = {(f"theme/{slug}" if slug in plugins else slug): entry
+              for slug, entry in data.get("themes", {}).items()}
     core = data.get("core", {})
 
     # 1. Plugins and themes with a vulnerability whose range covers a version
@@ -4274,10 +4438,12 @@ def check_vulns(ctx: RunContext) -> List[Finding]:
                      + ", so core could not be checked against the "
                      "vulnerability data. Hiding it is good practice; it also "
                      "means this report cannot say whether core is current."})
-    elif core.get("covered") is False:
+    elif not core.get("covered"):
         gaps.append({"Component": f"WordPress core {detected}",
                      "What was not checked": core.get("lookup_error")
-                     or "no vulnerability record for this version"})
+                     or ("no vulnerability record for this version"
+                         if "covered" in core else
+                         "the vulnerability lookup did not run")})
     for slug, entry in sorted({**plugins, **themes}.items()):
         reasons = []
         if not entry.get("covered"):
@@ -4394,11 +4560,26 @@ def check_transport(ctx: RunContext) -> List[Finding]:
 
     tls = data.get("tls", {})
     days = tls.get("days_left")
-    if isinstance(days, int) and days < 21:
+    expired = tls.get("seconds_left", days) is not None and \
+        tls.get("seconds_left", days) < 0
+    if tls.get("verify_error"):
         findings.append(Finding(
-            "transport-tls", "MEDIUM" if days > 0 else "CRITICAL",
-            f"The TLS certificate expires in {days} day(s)"
-            if days > 0 else "The TLS certificate has expired",
+            "transport-tls-invalid", "CRITICAL",
+            f"The TLS certificate fails verification: {tls['verify_error']}",
+            "A browser shows a full-page security warning before the site "
+            "loads, and most visitors leave. An expired certificate, one "
+            "issued for a different name, and one from an untrusted issuer "
+            "all land here.",
+            "Check the certificate at the host or CDN today. If it expired, "
+            "look for a failing renewal; if the name is wrong, the "
+            "certificate on this server was issued for another site.",
+            [{"Host": data.get("host", "?"),
+              "Verification error": tls["verify_error"]}], "transport.json"))
+    elif isinstance(days, int) and days < 21:
+        findings.append(Finding(
+            "transport-tls", "CRITICAL" if expired else "MEDIUM",
+            "The TLS certificate has expired" if expired
+            else f"The TLS certificate expires in {days} day(s)",
             "An expired certificate makes every browser show a full-page "
             "security warning before the site loads. Most automatic "
             "renewals happen 30 days out, so this close to expiry usually "
@@ -4523,7 +4704,7 @@ def check_dns(ctx: RunContext) -> List[Finding]:
             "move to p=reject.",
             [{"Domain": f"_dmarc.{domain}", "DMARC": "absent"}], "dns.json"))
     elif data.get("dmarc", "").startswith("v=DMARC1"):
-        policy = re.search(r"p=(\w+)", data["dmarc"])
+        policy = re.search(r"\bp=(\w+)", data["dmarc"])
         if policy and policy.group(1).lower() == "none":
             findings.append(Finding(
                 "dns-dmarc-none", "LOW",
@@ -4579,20 +4760,21 @@ def _evidence_table(finding: Finding) -> str:
         return ""
     # Union of keys, not row 0's: evidence built from different sources can
     # legitimately carry different columns.
-    headers = list(dict.fromkeys(k for r in finding.evidence for k in r))
+    shown = finding.evidence[:EVIDENCE_ROWS]
+    headers = list(dict.fromkeys(k for r in shown for k in r))
     head = "".join(f"<th>{escape(str(h))}</th>" for h in headers)
     body = ""
-    for row in finding.evidence:
+    for row in shown:
         cells = "".join(f"<td>{escape(str(row.get(h, '')))}</td>"
                         for h in headers)
         body += f"<tr>{cells}</tr>"
     more = ""
-    if finding.count > len(finding.evidence):
+    if finding.count > len(shown):
         # --standalone readers have no run directory to be pointed at.
         where = ("kept with the run this report came from"
                  if EVIDENCE_ROWS >= EVIDENCE_ROWS_ALL else
                  "in the run directory")
-        more = (f"<p class='more'>Showing {len(finding.evidence)} of "
+        more = (f"<p class='more'>Showing {len(shown)} of "
                 f"{finding.count}. The full list is in "
                 f"<code>{escape(finding.source)}</code>, {where}.</p>")
     return (f"<div class='scroll'><table><thead><tr>{head}</tr></thead>"
@@ -4656,26 +4838,33 @@ def _profile_block(ctx: RunContext) -> str:
         f"{assets.get('pages_in_sitemap', 0)} in the sitemap")
     add("Cache states seen during the sweep",
         ", ".join(assets.get("cache_states", [])) or "none reported")
-    add("TLS", f"{tls.get('protocol', '?')}, {tls.get('issuer', '?')}, "
-               f"expires {tls.get('expires', '?')}"
-        if tls and "error" not in tls else "")
+    add("TLS", (f"{tls.get('protocol', '?')}, {tls.get('issuer', '?')}, "
+                f"expires {tls.get('expires', '?')}" if "error" not in tls
+                else f"fails verification: {tls['verify_error']}"
+                if tls.get("verify_error") else f"not measured ({tls['error']})")
+        if tls else "")
     add("Plain HTTP",
         f"HTTP {transport.get('http', {}).get('status', '?')}"
         + (f" to {transport['http']['location']}"
            if transport.get("http", {}).get("location") else ""))
-    add("XML-RPC", "answering"
-        if transport.get("xmlrpc", {}).get("answering") else "not answering")
-    add("security.txt", "present"
-        if transport.get("security_txt", {}).get("present") else "absent")
+    # A module that did not run measured nothing; a default here read as
+    # "not answering" and "absent" for checks that never happened.
+    if transport:
+        add("XML-RPC", "answering"
+            if transport.get("xmlrpc", {}).get("answering") else "not answering")
+        add("security.txt", "present"
+            if transport.get("security_txt", {}).get("present") else "absent")
     add("Application passwords",
         "enabled (the WordPress default)"
         if (rest.get("authentication") or {}).get("application-passwords")
         else "not advertised by the REST index")
-    add("SPF", dns.get("spf") or "absent")
-    add("DMARC", dns.get("dmarc")
-        or (f"delegated to {dns['dmarc_delegated_to']}"
-            if dns.get("dmarc_delegated_to") else "absent"))
-    add("MX", ", ".join(dns.get("mx", [])) or "none (this domain receives no mail)")
+    if dns:
+        add("SPF", dns.get("spf") or "absent")
+        add("DMARC", dns.get("dmarc")
+            or (f"delegated to {dns['dmarc_delegated_to']}"
+                if dns.get("dmarc_delegated_to") else "absent"))
+        add("MX", ", ".join(dns.get("mx", []))
+            or "none (this domain receives no mail)")
 
     body = "".join(f"<tr><th scope='row'>{escape(k)}</th>"
                    f"<td>{escape(str(v))}</td></tr>" for k, v in rows)
@@ -5230,7 +5419,10 @@ def selftest() -> int:
     #     truncating.
     big = Finding("y", "INFO", "t", "m", "r",
                   [{"n": i} for i in range(EVIDENCE_ROWS + 5)], "s")
-    check("evidence is capped", len(big.evidence), EVIDENCE_ROWS)
+    check("evidence is capped on the page",
+          _evidence_table(big).count("<tr>") - 1, EVIDENCE_ROWS)
+    check("evidence is whole in the finding (findings.json)",
+          len(big.evidence), EVIDENCE_ROWS + 5)
     check("truncation is disclosed", "Showing" in _evidence_table(big), True)
 
     # 11b. --standalone lifts the cap. The flag rebinds the global, so this
@@ -5684,6 +5876,7 @@ def selftest() -> int:
                 (404 if "gone" in url else 200),
                 {"content-type": "application/pdf"}, "")
             ctx = RunContext(cur_dir, args)
+            ctx.manifest["modules"]["media"] = {"status": "ok"}
             collect_documents(ctx)
             rows = {r["url"].rsplit("/", 1)[1]: r for r in ctx.data("documents")}
             check("carry: previous run's missed orphan is back, marked",
@@ -5702,6 +5895,16 @@ def selftest() -> int:
             check("carry: orphan and removed findings both present",
                   ("docs-orphan" in fids, "docs-removed" in fids,
                    "docs-dead" in fids), (True, True, False))
+            # The same documents with the media walk not complete: absence
+            # from it proves nothing about the library.
+            ctx.manifest["modules"]["media"] = {"status": "partial"}
+            ctx._cache.clear()
+            collect_documents(ctx)
+            fids = [f.fid for f in check_documents(ctx)]
+            check("carry: no orphan claim without a complete media walk",
+                  ("docs-orphan" in fids, "docs-library-unknown" in fids,
+                   {r["in_library"] for r in ctx.data("documents")}),
+                  (False, True, {None}))
             # The carried row persists: a third run whose discovery misses
             # it again still inherits it from this run.
             nxt = Path(tmp) / "x_test_20260911_000000"
@@ -5877,6 +6080,170 @@ def selftest() -> int:
     check("--delay is read as seconds",
           parse_args(["--delay", "2", "--selftest"]).delay, 2.0)
 
+    # 35. The 2026-10-21 review: each shape below produced a wrong report.
+    check("xml-rpc: the stock 405 refusal is answering",
+          xmlrpc_answering(405, "XML-RPC server accepts POST requests only."), True)
+    check("xml-rpc: a bare 405 is not", xmlrpc_answering(405, "Method Not Allowed"), False)
+    check("xml-rpc: a block page is not", xmlrpc_answering(403, "<html>"), False)
+    check("cookie: words in the value are not attributes",
+          cookie_flags("session=secure-httponly-samesite; Path=/"),
+          {"secure": False, "httponly": False, "samesite": False})
+    check("cookie: real attributes, any case",
+          cookie_flags("a=b; Expires=Wed, 21 Oct 2026 07:28:00 GMT; SECURE; "
+                       "HttpOnly; SameSite=Lax"),
+          {"secure": True, "httponly": True, "samesite": True})
+    stamp = "Oct 21 12:00:00 2026 GMT"
+    noon = ssl.cert_time_to_seconds(stamp)
+    check("tls: lapsing later today is 0 days, not expired",
+          (_tls_time_left(stamp, noon - 3600)["days_left"],
+           _tls_time_left(stamp, noon - 3600)["seconds_left"] > 0), (0, True))
+    check("tls: an hour past notAfter is expired",
+          _tls_time_left(stamp, noon + 3600)["seconds_left"] < 0, True)
+    check("scope: a sitemap child on another host is refused",
+          _in_scope("http://127.0.0.1:9999/internal.xml", "https://x.test"), False)
+    check("scope: the www. variant is the same site",
+          _in_scope("https://www.x.test/page/", "https://x.test"), True)
+    check("scope: a non-http URL is refused",
+          _in_scope("file:///etc/passwd", "https://x.test"), False)
+    check("resume: www. and scheme do not change the site",
+          _site_key("http://WWW.x.test/") == _site_key("https://x.test"), True)
+    check("resume: another host is another site",
+          _site_key("https://a.test") == _site_key("https://b.test"), False)
+    import contextlib
+    import io
+    for bad in (["--only", "vulnz", "--site", "x.test"],
+                ["--delay", "nan", "--site", "x.test"]):
+        try:
+            with contextlib.redirect_stderr(io.StringIO()):
+                parse_args(bad)
+            check(f"cli: {bad[0]} {bad[1]} is refused", "accepted", "refused")
+        except SystemExit:
+            pass
+    try:
+        normalise_site("https://x.test/blog?x=1")
+        check("cli: a site with a query is refused", "accepted", "refused")
+    except ValueError:
+        pass
+    check("version: beta < rc", version_key("2.0-beta1") < version_key("2.0-rc2"), True)
+    check("version: rc1 < rc2", version_key("2.0-rc1") < version_key("2.0-rc2"), True)
+    check("version: rc < release", version_key("2.0-rc2") < version_key("2.0"), True)
+    check("version: build metadata is the release",
+          version_key("2.0+build1") == version_key("2.0"), True)
+    check("version: a fifth segment counts",
+          version_key("1.0.0.0.1") < version_key("1.0.0.0.2"), True)
+    check("version: 1.10 above 1.9, 6.6 equal to 6.6.0",
+          (version_key("1.10") > version_key("1.9"),
+           version_key("6.6") == version_key("6.6.0")), (True, True))
+    check(".env: a challenge fragment is not an env file",
+          content_matches("/.env", "<div>Please wait token=abc</div>"), False)
+    check(".env: a real one is",
+          content_matches("/.env", "# app\nAPP_ENV=production\nDB_PASSWORD=x\n"), True)
+    check(".htpasswd: an error line is not a password file",
+          content_matches("/.htpasswd", "Access denied: please retry"), False)
+    check(".htpasswd: a real one is",
+          content_matches("/.htpasswd", "admin:$apr1$abc123$Zx9QxQxQxQxQxQxQ\n"), True)
+    check("config source: the text of wp-config is a leak",
+          config_source_leaked(200, "<?php define('DB_NAME','x'); "
+                                    "define('DB_PASSWORD','y');"), True)
+    check("config source: a page naming DB_PASSWORD is not",
+          config_source_leaked(200, "<p>Set DB_PASSWORD in wp-config</p>"), False)
+
+    # A plugin and a theme sharing a slug both keep their findings, and a
+    # core CVE lookup does not wait on the release list.
+    with tempfile.TemporaryDirectory() as tmp:
+        ctx = RunContext(Path(tmp), argparse.Namespace(url=[], site="https://x.test"))
+        row = {"cve": "CVE-1", "name": "n", "score": 9.0, "severity": "CRITICAL",
+               "affected_version": "1.0"}
+        ctx.write("vulns", {"core": {}, "plugins": {"demo": {
+            "vulnerabilities": [row], "detected_versions": ["1.0"],
+            "covered": True, "wporg": {"found": True}}},
+            "themes": {"demo": {"vulnerabilities": [], "detected_versions": ["1"],
+                                "covered": True, "wporg": {"found": True}}}})
+        found = {f.fid: f for f in check_vulns(ctx)}
+        check("slug collision: the plugin's advisory survives the theme",
+              any("CVE-1" in json.dumps(f.evidence) for f in found.values()), True)
+    saved_api = {k: g[k] for k in ("_wporg", "_wpvuln")}
+    try:
+        g["_wporg"] = lambda url: None
+        g["_wpvuln"] = lambda kind, slug: {"covered": True, "error": "",
+                                          "record": {"vulnerability": []}}
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx = RunContext(Path(tmp), argparse.Namespace(url=[], site="https://x.test"))
+            ctx.write("headers", {"core_versions": {"generator": "6.0"}})
+            collect_vulns(ctx)
+            check("core: CVE lookup runs with the release list down",
+                  ctx.data("vulns")["core"].get("covered"), True)
+    finally:
+        g.update(saved_api)
+
+    # Carried documents: only 404/410 is removal; 429/403/503 are unmeasured.
+    with tempfile.TemporaryDirectory() as tmp:
+        prev = Path(tmp) / "x_test_20261001_000000"
+        cur = Path(tmp) / "x_test_20261002_000000"
+        prev.mkdir(); cur.mkdir()
+        codes = {"a": 429, "b": 403, "c": 503, "d": 404, "e": 410}
+        (prev / "documents.json").write_text(json.dumps(
+            [{"url": f"https://x.test/{k}.pdf", "status": 200} for k in codes]))
+        saved_fetch = g["fetch"]
+        try:
+            g["fetch"] = lambda url, **k: (
+                codes[url.rsplit("/", 1)[1][0]], {"content-type": "application/pdf"}, "")
+            ctx = RunContext(cur, argparse.Namespace(url=[], site="https://x.test"))
+            collect_documents(ctx)
+            carry = ctx.manifest["meta"]["documents_carry"]
+            check("carry: only 404 and 410 count as removed",
+                  (carry["removed"], carry["unmeasured"]), (2, 3))
+            # A PDF URL that lands on an HTML page is not a document.
+            g["fetch"] = lambda url, **k: (200, {"content-type": "text/html"}, "")
+            (Path(tmp) / "z").mkdir()
+            ctx2 = RunContext(Path(tmp) / "z", argparse.Namespace(
+                url=["/staff-handbook.pdf"], site="https://x.test"))
+            collect_documents(ctx2)
+            check("documents: a redirect to an HTML page raises nothing",
+                  [f.fid for f in check_documents(ctx2)], [])
+        finally:
+            g["fetch"] = saved_fetch
+
+    # Sitemap cap is disclosed; a plugin path with no ?ver= is inventoried.
+    sitemap = "<urlset>" + "".join(f"<loc>https://x.test/p{i}/</loc>"
+                                   for i in range(120)) + \
+              "<loc>http://127.0.0.1:9999/internal/</loc></urlset>"
+    saved_fetch = g["fetch"]
+    try:
+        g["fetch"] = lambda url, **k: (
+            (200, {}, sitemap) if "sitemap" in url else
+            (404, {}, "") if "readme.txt" in url else
+            (200, {}, "<script src='/wp-content/plugins/demo/app.js'></script>"))
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx = RunContext(Path(tmp), argparse.Namespace(url=[], site="https://x.test"))
+            status, _, note = collect_assets(ctx)
+            data = ctx.data("assets")
+            check("assets: sitemap total counted before the cap, off-site URL dropped",
+                  (data["pages_checked"], data["pages_in_sitemap"],
+                   "120 pages" in note), (ASSET_MAX_PAGES, 120, True))
+            check("assets: a versionless plugin path is inventoried",
+                  "demo" in data["plugins"], True)
+    finally:
+        g["fetch"] = saved_fetch
+
+    # Exit-code and resume guards in main().
+    with tempfile.TemporaryDirectory() as tmp:
+        with contextlib.redirect_stdout(io.StringIO()):
+            check("render-only: an empty run directory is refused",
+                  main(["--run-dir", tmp, "--render-only", "--no-open"]), 2)
+            (Path(tmp) / "manifest.json").write_text(json.dumps(
+                {"modules": {}, "meta": {"site": "https://old.test"}}))
+            check("resume: another --site on a saved run is refused",
+                  main(["--run-dir", tmp, "--site", "new.test", "--no-open"]), 2)
+            def crashing(ctx):
+                raise RuntimeError("synthetic")
+            CHECKS.append(crashing)
+            try:
+                check("exit: a crashed check makes the run incomplete, not clean",
+                      main(["--run-dir", tmp, "--render-only", "--no-open"]), 3)
+            finally:
+                CHECKS.remove(crashing)
+
     if failures:
         print("selftest FAILED:")
         for f in failures:
@@ -5889,6 +6256,23 @@ def selftest() -> int:
 ###############################################################################
 # CLI / MAIN
 ###############################################################################
+
+def _saved_site(run_dir: Path) -> str:
+    """The site a run directory's manifest was recorded for, or ""."""
+    try:
+        manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
+        return (manifest.get("meta") or {}).get("site", "") or ""
+    except (OSError, ValueError, AttributeError):
+        return ""
+
+
+def _site_key(site: str) -> str:
+    """Host, port and path of a site, ignoring scheme, case, www. and the
+    trailing slash, which normalise_site() may have changed on the first run."""
+    parsed = urllib.parse.urlparse(site if "://" in site else "https://" + site)
+    host = re.sub(r"^www\.", "", parsed.netloc.lower())
+    return (host + parsed.path).rstrip("/")
+
 
 def normalise_site(raw: str) -> Tuple[str, str]:
     """Return (site, note). Rejects a bare host and upgrades http to https.
@@ -5912,6 +6296,11 @@ def normalise_site(raw: str) -> Tuple[str, str]:
         raise ValueError(f"unsupported scheme: {parsed.scheme}://")
     if not parsed.netloc:
         raise ValueError(f"could not read a hostname from {raw!r}")
+    # Endpoints are built by appending to the site string, so a query or a
+    # fragment would swallow them: ?x=1/wp-json/.
+    if parsed.query or parsed.fragment or "@" in parsed.netloc:
+        raise ValueError("give the site without a query, fragment or "
+                         "user:password, e.g. https://www.example.com")
 
     # Where does the root actually live? Three shapes matter. http:// to
     # https:// on the same host is upgraded. example.com to www.example.com
@@ -6012,6 +6401,16 @@ def parse_args(argv=None):
         parser.error("--render-only needs --run-dir")
     if not (args.selftest or args.list or args.site or args.run_dir):
         parser.error("--site is required (or --run-dir to resume)")
+    # A typo here used to run calibration and headers alone and exit 0.
+    known = {m["key"] for m in MODULES}
+    for flag in ("only", "skip"):
+        unknown = {k.strip() for k in (getattr(args, flag) or "").split(",")
+                   if k.strip()} - known
+        if unknown:
+            parser.error(f"--{flag}: unknown module(s) {', '.join(sorted(unknown))}"
+                         f"; --list shows the keys")
+    if not 0 <= args.delay < float("inf"):
+        parser.error("--delay must be a finite number of seconds, 0 or more")
     return args
 
 
@@ -6071,6 +6470,20 @@ def main(argv=None):
         if not run_dir.is_dir():
             print(f"Run directory not found: {run_dir}")
             return 2
+        saved_site = _saved_site(run_dir)
+        if args.render_only and not saved_site:
+            # An empty directory rendered "every module ran" and exited 0.
+            print(f"No run recorded in {run_dir}: manifest.json is missing "
+                  "or names no site")
+            return 2
+        # The saved evidence belongs to the saved site. Accepting another
+        # --site relabelled it as the new one.
+        if args.site and saved_site and \
+                _site_key(args.site) != _site_key(saved_site):
+            print(f"{run_dir} is a run for {saved_site}, not {args.site}. "
+                  "Leave --site off to resume it, or start a new run.")
+            return 2
+        args.site = saved_site or args.site
     else:
         try:
             args.site, scheme_note = normalise_site(args.site)
@@ -6117,12 +6530,14 @@ def main(argv=None):
     # calibration and REST both refused, exit 0).
     unmeasured = sorted(k for k, v in ctx.manifest["modules"].items()
                         if v.get("status") == "error")
+    # A crashed check dropped every finding it would have made.
+    unmeasured += sorted(ctx.manifest["meta"].get("check_errors") or {})
     if worst:
         print_warning(f"Highest severity found: {worst}. "
                       "Open exposure_report.html for the detail.")
     elif unmeasured:
-        print_warning("No critical or high findings, but these modules "
-                      f"measured nothing: {', '.join(unmeasured)}. The run "
+        print_warning("No critical or high findings, but these modules or "
+                      f"checks measured nothing: {', '.join(unmeasured)}. The run "
                       "is incomplete, not clean.")
     else:
         print_success("No critical or high findings. Read the Coverage and "

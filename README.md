@@ -13,7 +13,8 @@ what you found while you wait for a reply.
 self-contained HTML report you can hand to whoever owns the site.
 
 Every request is a GET or a HEAD. Nothing is submitted, guessed or written.
-Stdlib only, no packages to install, one file.
+One request, to `wp-cron.php`, runs any scheduled tasks the site has due, as
+an ordinary page view can. Stdlib only, no packages to install, one file.
 
 ```sh
 python3 wp_audit.py --site https://www.example.com
@@ -60,7 +61,8 @@ every path checked including the clean ones, coverage gaps, what the tool
 checks, and the methodology.
 
 Exit code is `1` when anything CRITICAL or HIGH was found, `3` when nothing
-was but a module could not measure at all (rate limited or unreachable), `0`
+was but a module could not measure at all (rate limited or unreachable) or a
+check crashed, `2` for a bad argument or a run directory that does not match, `0`
 otherwise, `130` if you stopped it with Ctrl-C. That makes it usable as a
 gate in a scheduled job.
 
@@ -68,8 +70,9 @@ gate in a scheduled job.
 
 **GET and HEAD only.** No POST, no form submission, no password guessing, no
 injection payloads, no load testing, nothing behind a login. A full run is a
-few hundred ordinary page fetches with a 150ms gap between them, which is safe
-against production and inside the terms of hosts that forbid load testing.
+few hundred ordinary page fetches with a 150ms gap between them. The one that
+does work on the server is `wp-cron.php`, which runs any scheduled tasks that
+are due.
 
 **This is not a penetration test.** It cannot find injection flaws, broken
 access control behind a login, or anything a read-only request will not reveal.
@@ -87,7 +90,7 @@ unknown. It does not find out. Finding out means submitting.
 
 ## What it checks
 
-Ten modules. `--list` prints this with descriptions.
+Eleven modules. `--list` prints this with descriptions.
 
 | Key | Area |
 |---|---|
