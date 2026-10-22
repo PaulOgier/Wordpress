@@ -102,7 +102,7 @@ Eleven modules. `--list` prints this with descriptions.
 | `media` | The whole media library, walked and reconciled against the reported total |
 | `documents` | Each document resolved, filenames triaged |
 | `assets` | Plugin versions from cache-busted asset URLs across the sitemap, cross-checked against each plugin's `readme.txt` |
-| `vulns` | Every detected plugin, theme and core version looked up for currency, withdrawal from the directory and published CVEs |
+| `vulns` | Every detected plugin, theme, core and PHP version looked up for currency, withdrawal from the directory and published CVEs, plus PHP branches past end of life |
 | `transport` | HTTP-to-HTTPS, TLS, CORS, XML-RPC, `wp-cron.php`, `security.txt` |
 | `dns` | SPF and DMARC for the website domain, including the DMARC policy a subdomain inherits |
 
@@ -388,6 +388,14 @@ sitemap pages).
   same tag on a cache-busted request, the feed, `wp-includes` asset URLs),
   and whether they agree. A core vulnerability finding keeps its CVSS
   severity only when two sources agree; otherwise it is capped and says why.
+- The PHP version from `X-Powered-By` on the homepage and on a cache-busted
+  request. A page cache replays the header it stored, so a PHP finding keeps
+  its severity only when the cache-busted request named the version. A PHP
+  branch past its end of life is HIGH on its own, because the vulnerability
+  feed stops listing new issues for it.
+  A PHP CVE whose own description confines it to Windows builds is
+  labelled "Windows only" and does not set the severity unless the headers
+  suggest a Windows server; it is still listed.
 - How the site answers a path that cannot exist, and whether the control proved
   the calibration still lets real files through.
 - Whether the media walk reached the whole library, and by how much it fell

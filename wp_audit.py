@@ -42,8 +42,8 @@ jurisdictions. See "Safety posture" below for what this does and does not do.
 
 Author:       Paul Ogier
 Created:      2026-09-03
-Updated:      2026-10-21
-Version:      1.10.0
+Updated:      2026-10-22
+Version:      1.11.0
 Status:       Production
 Python:       3.9+
 Dependencies: Stdlib only. `dig` is used for DNS when present, with a
@@ -215,7 +215,7 @@ from typing import Dict, List, Optional, Tuple
 # CONFIGURATION
 ###############################################################################
 
-SCRIPT_VERSION = "1.10.0"
+SCRIPT_VERSION = "1.11.0"
 
 # [OPTIONAL] Startup check against the remote VERSION file. Fail-silent.
 CHECK_FOR_UPDATES = True
@@ -684,6 +684,10 @@ ABANDONED_DAYS = 730
 # before it is worth saying so. One major is normal in the weeks after a core
 # release; two means nobody has looked.
 TESTED_MAJORS_BEHIND = 2
+
+# PHP CVE descriptions that confine the bug to Windows builds.
+WINDOWS_ONLY = re.compile(r"\bon Windows\b|Windows environment|Windows codepage",
+                          flags=re.I)
 
 # CVSS base score -> the severity this report gives the finding.
 CVSS_BANDS = [(9.0, "CRITICAL"), (7.0, "HIGH"), (4.0, "MEDIUM")]
@@ -1171,6 +1175,24 @@ def cap_severity(severity: str, ceiling: str) -> str:
             else severity)
 
 
+def _cvss(entry: Dict) -> Dict:
+    """The scored CVSS block of a wpvulnerability record.
+
+    Some records carry only `cvss3` (every PHP record, and a few core and
+    plugin ones); reading `cvss` alone showed those as unscored MEDIUM, which
+    put php2shell's 9.8 below a 7.2 plugin bug.
+    """
+    impact = entry.get("impact") or {}
+    for key in ("cvss", "cvss3"):
+        block = impact.get(key) or {}
+        try:
+            if float(block.get("score")) > 0:
+                return block
+        except (TypeError, ValueError):
+            pass
+    return impact.get("cvss") or {}
+
+
 def _vuln_rows(record: Dict, version: str) -> Tuple[List[Dict], int]:
     """Vulnerabilities from a wpvulnerability record that cover `version`.
 
@@ -1200,7 +1222,7 @@ def _vuln_rows(record: Dict, version: str) -> Tuple[List[Dict], int]:
             continue
         if not verdict:
             continue
-        cvss = ((entry.get("impact") or {}).get("cvss") or {})
+        cvss = _cvss(entry)
         try:
             score = float(cvss.get("score"))
         except (TypeError, ValueError):
@@ -1267,7 +1289,7 @@ def _core_rows(record: Dict) -> List[Dict]:
     """
     rows = []
     for entry in record.get("vulnerability") or []:
-        cvss = ((entry.get("impact") or {}).get("cvss") or {})
+        cvss = _cvss(entry)
         try:
             score = float(cvss.get("score"))
         except (TypeError, ValueError):
@@ -2032,6 +2054,14 @@ def collect_paths(ctx: RunContext) -> Tuple[str, int, str]:
     return "ok", len(rows), ""
 
 
+def _php_version(hdrs: Dict[str, str]) -> str:
+    """The PHP release named in X-Powered-By or Server, or "" if none."""
+    match = re.search(r"\bPHP[ /](\d+\.\d+\.\d+)",
+                      hdrs.get("x-powered-by", "") + " " + hdrs.get("server", ""),
+                      flags=re.I)
+    return match.group(1) if match else ""
+
+
 def collect_headers(ctx: RunContext) -> Tuple[str, int, str]:
     """Security headers, leaky headers and cookie flags from the homepage."""
     status, hdrs, body = fetch(ctx.site + "/")
@@ -2054,6 +2084,11 @@ def collect_headers(ctx: RunContext) -> Tuple[str, int, str]:
     # copy built before the last update. Sources are kept apart so a
     # disagreement is visible rather than averaged away.
     core_versions: Dict[str, str] = {}
+    # A LiteSpeed cache hit replays the X-Powered-By it stored, so a cached
+    # homepage reported PHP 8.2.34 a day after the site moved to 8.3.35.
+    php_versions: Dict[str, str] = {}
+    if _php_version(hdrs):
+        php_versions["homepage"] = _php_version(hdrs)
     for g in generators:
         if g.lower().startswith("wordpress"):
             core_versions["generator"] = re.sub(r"^wordpress\s*", "", g,
@@ -2072,7 +2107,10 @@ def collect_headers(ctx: RunContext) -> Tuple[str, int, str]:
     if status == 200 and not edge["challenged"]:
         # Same page, cache-busted, generator only. If this disagrees with the
         # first reading the cached copy is stale and the report says so.
-        _, _, fresh = fetch(f"{ctx.site}/?nc={uuid.uuid4().hex[:8]}")
+        _, fresh_hdrs, fresh = fetch(f"{ctx.site}/?nc={uuid.uuid4().hex[:8]}")
+        php = _php_version(fresh_hdrs)
+        if php:
+            php_versions["homepage (cache-busted)"] = php
         for g in re.findall(r'<meta name="generator" content="([^"]+)"', fresh):
             if g.lower().startswith("wordpress"):
                 core_versions["generator (cache-busted)"] = re.sub(
@@ -2139,6 +2177,7 @@ def collect_headers(ctx: RunContext) -> Tuple[str, int, str]:
         "cookies": cookies,
         "generators": generators,
         "core_versions": core_versions,
+        "php_versions": php_versions,
         "theme": themes,
         "theme_info": theme_info,
         "homepage_plugins": sorted(set(re.findall(
@@ -2836,6 +2875,35 @@ def collect_vulns(ctx: RunContext) -> Tuple[str, int, str]:
         core["vulnerabilities"] = _core_rows(lookup["record"])
         core["undecidable"] = 0
     data["core"] = core
+
+    # PHP. /php/<version>/ returns every record for the branch, so ranges are
+    # matched like a plugin's. An end-of-life branch gets no new records
+    # (7.4 has no php2shell entry), which is why date_end is kept.
+    php_sources = dict(headers.get("php_versions") or {})
+    detected_php = (php_sources.get("homepage (cache-busted)")
+                    or php_sources.get("homepage", ""))
+    php: Dict = {"detected": detected_php, "sources": php_sources}
+    if detected_php:
+        lookup = _wpvuln("php", detected_php)
+        php["covered"] = lookup["covered"]
+        php["lookup_error"] = lookup["error"]
+        php["branch_end"] = lookup["record"].get("date_end") or ""
+        php["vulnerabilities"], php["undecidable"] = _vuln_rows(
+            lookup["record"], detected_php)
+        # Some PHP CVEs only exist on Windows builds (CVE-2024-4577 is a 9.8
+        # that is "unfixed" on 7.4). The feed has no platform field, so the
+        # CVE text decides, matched narrowly: a miss still counts against
+        # the site, which is the safe direction.
+        windows_text = {s.get("id"): bool(WINDOWS_ONLY.search(s.get("description") or ""))
+                        for e in lookup["record"].get("vulnerability") or []
+                        for s in e.get("source") or []}
+        for row in php["vulnerabilities"]:
+            row["windows_only"] = windows_text.get(row["cve"], False)
+        server = " ".join((headers.get("headers") or {}).get(h, "")
+                          for h in ("server", "x-powered-by"))
+        php["windows_server"] = bool(re.search(r"iis|win32|win64|asp\.net",
+                                               server, flags=re.I))
+    data["php"] = php
 
     # Plugins. Sorted so a resumed run and a fresh run produce the same file.
     for slug, info in sorted(plugins.items()):
@@ -4419,6 +4487,65 @@ def check_vulns(ctx: RunContext) -> List[Finding]:
               "Releases behind": core["releases_behind"]}],
             "vulns.json", 1))
 
+    # 4b. PHP, from X-Powered-By. A reading only a cached page gave is
+    #     capped, like core: the cache replays the header it stored.
+    php = data.get("php") or {}
+    php_v = php.get("detected", "")
+    php_sources = php.get("sources") or {}
+    php_live = bool(php_sources.get("homepage (cache-busted)"))
+    php_note = ("" if php_live else
+                " Only a cached page disclosed the version, so this is "
+                "something to confirm rather than a confirmed exposure.")
+    if len(set(php_sources.values())) > 1:
+        php_note += (" The cached homepage and a cache-busted request disagree ("
+                     + "; ".join(f"{k}: {v}" for k, v in php_sources.items())
+                     + "); the cache-busted reading is the one used.")
+    if php.get("vulnerabilities"):
+        rows = php["vulnerabilities"]
+        counted = [r for r in rows
+                   if php.get("windows_server") or not r.get("windows_only")]
+        severity = (cvss_severity(max(row["score"] for row in counted))
+                    if counted else "LOW")
+        if not php_live:
+            severity = cap_severity(severity, "MEDIUM")
+        windows_note = ""
+        if len(counted) < len(rows):
+            windows_note = (f" {len(rows) - len(counted)} of these apply only to "
+                         "PHP on Windows, by the CVE's own description, and "
+                         "nothing in the headers suggests a Windows server, "
+                         "so they do not set this finding's severity.")
+        findings.append(Finding(
+            "vulns-php", severity,
+            f"PHP {php_v} has {len(rows)} published vulnerability(ies) against it",
+            "The PHP release this site names in its X-Powered-By header falls "
+            "inside the affected range of a published PHP vulnerability. A "
+            "host can backport a fix without changing the version number, so "
+            "this is the version's record, not proof the server is "
+            "exploitable." + windows_note + php_note,
+            "Move the site to a supported PHP release at or above the highest "
+            "Fixed in version below. On shared hosting the patch level is the "
+            "host's, so ask them when the patched build reaches this server.",
+            [{"Reference": row["cve"] or row["name"][:60],
+              "CVSS": f"{row['score']:.1f}" if row["score"] else "unscored",
+              "Fixed in": "no fix" if row["unfixed"] else row["fixed_in"],
+              "Platform": "Windows only" if row.get("windows_only") else "any",
+              "Details": row["reference"]}
+             for row in rows], "vulns.json", len(rows)))
+    end = php.get("branch_end", "")
+    if php_v and end and end < datetime.now().strftime("%Y-%m-%d"):
+        branch = ".".join(php_v.split(".")[:2])
+        findings.append(Finding(
+            "vulns-php-eol", "HIGH" if php_live else "MEDIUM",
+            f"PHP {branch} stopped receiving security fixes on {end}",
+            f"The site names PHP {php_v}. Nothing found in PHP {branch} since "
+            f"{end} has been fixed, and the vulnerability feed stops listing "
+            "new issues for a dead branch, so any PHP vulnerability list in "
+            "this report understates the exposure." + php_note,
+            "Move the site to a supported PHP branch. Test on a staging copy "
+            "first: themes and plugins written for old PHP are what break.",
+            [{"Running": php_v, "Security support ended": end}],
+            "vulns.json", 1))
+
     # 5. What could not be checked. This finding exists because its absence
     #    is a lie: a plugin the vulnerability database has never heard of
     #    produces the same empty result as a plugin it has cleared.
@@ -4444,6 +4571,20 @@ def check_vulns(ctx: RunContext) -> List[Finding]:
                      or ("no vulnerability record for this version"
                          if "covered" in core else
                          "the vulnerability lookup did not run")})
+    if not php_v:
+        gaps.append({"Component": "PHP",
+                     "What was not checked": "neither X-Powered-By nor Server "
+                     "names a PHP version, so PHP could not be checked against "
+                     "the vulnerability data. Hiding it is good practice; ask "
+                     "the host which release serves the site."})
+    elif not php.get("covered"):
+        gaps.append({"Component": f"PHP {php_v}",
+                     "What was not checked": php.get("lookup_error")
+                     or "the vulnerability lookup did not run"})
+    elif php.get("undecidable"):
+        gaps.append({"Component": f"PHP {php_v}",
+                     "What was not checked": f"{php['undecidable']} record(s) "
+                     "could not be decided"})
     for slug, entry in sorted({**plugins, **themes}.items()):
         reasons = []
         if not entry.get("covered"):
@@ -5794,6 +5935,83 @@ def selftest() -> int:
                  if f.fid == "vulns-closed"]
     check("a closure evidenced by asset URLs is still high",
           installed[0].severity if installed else "", "HIGH")
+
+    # 28b. PHP from X-Powered-By, matched against the branch record. The
+    #      record shape is wpvulnerability's /php/8.3.35/ as of 2026-10-22:
+    #      php2shell is "< 8.3.36" and scored only under cvss3.
+    check("PHP version read from X-Powered-By",
+          _php_version({"x-powered-by": "PHP/8.3.35"}), "8.3.35")
+    check("a Server header with no PHP gives nothing",
+          _php_version({"server": "LiteSpeed"}), "")
+    php2shell = {"name": "PHP 8.3", "date_end": "2027-12-31", "vulnerability": [
+        {"name": "PHP 8.3 < 8.3.36",
+         "source": [{"id": "CVE-2026-109618", "link": "https://x/"}],
+         "operator": {"max_version": "8.3.36", "max_operator": "lt", "unfixed": 0},
+         "impact": {"cvss3": {"score": "9.2", "vector": "CVSS:3.1/AV:N"}}}]}
+    rows, _ = _vuln_rows(php2shell, "8.3.35")
+    check("a cvss3-only record keeps its score", rows[0]["score"] if rows else 0, 9.2)
+    check("8.3.36 is clear of php2shell", _vuln_rows(php2shell, "8.3.36")[0], [])
+
+    def _php_ctx(sources, end="2027-12-31", version="8.3.35"):
+        rows, _ = _vuln_rows(php2shell, version)
+        vulns = {"plugins": {}, "themes": {}, "core": {},
+                 "php": {"detected": version, "sources": sources,
+                         "covered": True, "branch_end": end,
+                         "vulnerabilities": rows, "undecidable": 0}}
+
+        class _C:
+            def data(self, key):
+                return vulns if key == "vulns" else {}
+        return _C()
+
+    def _sev(ctx, fid):
+        hits = [f.severity for f in check_vulns(ctx) if f.fid == fid]
+        return hits[0] if hits else ""
+    live = {"homepage (cache-busted)": "8.3.35"}
+    check("php2shell on a live reading is critical",
+          _sev(_php_ctx(live), "vulns-php"), "CRITICAL")
+    check("a cached-only reading is capped",
+          _sev(_php_ctx({"homepage": "8.3.35"}), "vulns-php"), "MEDIUM")
+    check("the patched release raises nothing",
+          _sev(_php_ctx({"homepage (cache-busted)": "8.3.36"}, version="8.3.36"),
+               "vulns-php"), "")
+    check("an end-of-life branch is high on its own",
+          _sev(_php_ctx({"homepage (cache-busted)": "7.4.33"}, end="2022-11-28",
+                        version="7.4.33"), "vulns-php-eol"), "HIGH")
+    win = {"name": "PHP 7.4", "date_end": "2022-11-28", "vulnerability": [
+        {"name": "PHP 7.4 <= 7.4.33 (unfixed)",
+         "source": [{"id": "CVE-2024-4577", "description":
+                     "when using Apache and PHP-CGI on Windows"}],
+         "operator": {"max_version": "7.4.33", "max_operator": "le", "unfixed": 1},
+         "impact": {"cvss3": {"score": "9.8"}}}]}
+    win_rows, _ = _vuln_rows(win, "7.4.33")
+    win_rows = [dict(r, windows_only=True) for r in win_rows]
+    check("the Windows pattern matches CVE-2024-4577's wording",
+          bool(WINDOWS_ONLY.search(win["vulnerability"][0]["source"][0]["description"])),
+          True)
+    check("and not 'some systems, including Windows'",
+          bool(WINDOWS_ONLY.search("on some systems, including Windows, can")), False)
+
+    def _win_ctx(windows_server):
+        vulns = {"plugins": {}, "themes": {}, "core": {},
+                 "php": {"detected": "7.4.33", "covered": True,
+                         "sources": {"homepage (cache-busted)": "7.4.33"},
+                         "branch_end": "2022-11-28", "vulnerabilities": win_rows,
+                         "windows_server": windows_server, "undecidable": 0}}
+
+        class _C:
+            def data(self, key):
+                return vulns if key == "vulns" else {}
+        return _C()
+    check("a Windows-only CVE does not make a Linux host critical",
+          _sev(_win_ctx(False), "vulns-php"), "LOW")
+    check("it does on a Windows server",
+          _sev(_win_ctx(True), "vulns-php"), "CRITICAL")
+    eol = [f for f in check_vulns(_win_ctx(False)) if f.fid == "vulns-php-eol"]
+    check("the Windows note stays out of the end-of-life finding",
+          "Windows" in (eol[0].meaning if eol else "Windows"), False)
+    check("a supported branch is not end-of-life",
+          _sev(_php_ctx(live), "vulns-php-eol"), "")
 
     # 29. SPF with no sender is correct for a domain that sends no mail and
     #     wrong for one with an MX. Only the second is a finding.
