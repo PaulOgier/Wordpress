@@ -215,7 +215,7 @@ from typing import Dict, List, Optional, Tuple
 # CONFIGURATION
 ###############################################################################
 
-SCRIPT_VERSION = "1.11.0"
+SCRIPT_VERSION = "1.12.0"
 
 # [OPTIONAL] Startup check against the remote VERSION file. Fail-silent.
 CHECK_FOR_UPDATES = True
@@ -305,11 +305,14 @@ PROBE_PATHS: List[Tuple[str, str, str]] = [
     ("/adminer.php", "CRITICAL", "Adminer, a web database client"),
     ("/phpmyadmin/", "HIGH", "phpMyAdmin, a web database client"),
     ("/server-status", "MEDIUM", "the Apache status page, which lists live requests and visitor addresses"),
+    ("/wp-includes/rss.php", "LOW", "a PHP error that prints the server's file path, so display_errors is on and every PHP warning reaches visitors; turn it off in the PHP settings"),
     # Developer artefacts. Not a way in, but they name every library and its
     # version, which is the shortlist of exploits worth trying.
     ("/composer.json", "LOW", "the Composer manifest, which lists the PHP packages installed and their versions"),
     ("/package.json", "LOW", "the Node manifest, which lists the JavaScript packages used to build the site"),
     ("/.DS_Store", "LOW", "a macOS folder index, which lists the names of every file in the directory including ones nothing links to"),
+    ("/.wp-env.json", "LOW", "the wp-env development configuration, which names the plugins, themes and settings the site was built with"),
+    ("/wp-cli.yml", "LOW", "the WP-CLI configuration, which can name server paths, SSH aliases and the site's internal address"),
     # Directory listings.
     ("/wp-content/uploads/", "MEDIUM", "a browsable list of every uploaded file"),
     ("/wp-content/plugins/", "MEDIUM", "a browsable list of every installed plugin"),
@@ -317,6 +320,7 @@ PROBE_PATHS: List[Tuple[str, str, str]] = [
     ("/wp-includes/", "LOW", "a browsable WordPress core directory"),
     ("/vendor/", "LOW", "a browsable Composer vendor directory"),
     ("/node_modules/", "LOW", "a browsable Node modules directory"),
+    ("/wp-content/w3tc/dbcache/", "MEDIUM", "a browsable list of W3 Total Cache's cached database queries"),
     # Form and commerce upload directories. This is where client personal
     # information actually leaks: attachments visitors uploaded through a
     # form, order logs, file-manager backups. Only a browsable listing
@@ -388,6 +392,50 @@ CONTENT_MARKERS: Dict[str, Tuple[str, ...]] = {
     "/readme.html": ("wordpress",),
     "/license.txt": ("gnu general public license", "wordpress"),
 }
+
+# Paths that only mean something when the site advertises the plugin, keyed
+# by slug. Requested only for slugs found in asset URLs, REST namespaces or
+# the homepage, so no plugin is guessed. Paths from nuclei-templates.
+PLUGIN_PROBE_PATHS: Dict[str, List[Tuple[str, str, str]]] = {
+    "wordfence": [
+        ("/wp-content/wflogs/config.php", "HIGH", "the Wordfence firewall configuration, served as text"),
+        ("/wp-content/wflogs/config-synced.php", "HIGH", "the Wordfence firewall configuration, served as text"),
+        ("/wp-content/wflogs/rules.php", "MEDIUM", "the Wordfence firewall rules, served as text"),
+        ("/wp-content/wflogs/", "MEDIUM", "a browsable list of the Wordfence firewall's data files"),
+    ],
+    "enable-media-replace": [("/wp-content/uploads/EnableMediaReplace.log", "MEDIUM", "the Enable Media Replace log")],
+    "flexible-shipping": [("/wp-content/uploads/wpdesk-logs/wpdesk_debug.log", "MEDIUM", "the Flexible Shipping debug log")],
+    "wp-statistics": [("/wp-content/uploads/wp-statistics/debug.log", "MEDIUM", "the WP Statistics debug log")],
+    "gravityforms": [("/wp-content/plugins/gravityforms/debug.log", "MEDIUM", "the Gravity Forms debug log")],
+    "nextgen-gallery": [("/wp-content/plugins/nextgen-gallery/admin/php_errors.log", "MEDIUM", "the NextGEN Gallery PHP error log")],
+    "newsletter": [("/wp-content/plugins/newsletter/error_log", "MEDIUM", "a PHP error log inside the Newsletter plugin")],
+    "wps-hide-login": [("/wp-content/plugins/wps-hide-login/classes/error_log", "MEDIUM", "a PHP error log inside WPS Hide Login, which can name the hidden login address")],
+    "pretty-link": [("/wp-content/plugins/pretty-link/error_log", "MEDIUM", "a PHP error log inside the Pretty Links plugin")],
+    "wordpress-importer": [("/wp-content/plugins/wordpress-importer/error_log", "MEDIUM", "a PHP error log inside the WordPress Importer plugin")],
+    "easy-google-fonts": [("/wp-content/plugins/easy-google-fonts/error_log", "MEDIUM", "a PHP error log inside the Easy Google Fonts plugin")],
+}
+
+# Plugin logs must hold a timestamped or PHP-error line: a block page saying
+# "Access Denied [403]" passed the looser debug.log markers.
+PLUGIN_LOG_PATHS = set()
+PLUGIN_LOG_RE = re.compile(
+    r"(?im)^\[?\d{1,4}[-/.]\w{2,3}[-/.]\d{2,4}|php (?:warning|notice|fatal|deprecated|parse)")
+for _slug, _probes in PLUGIN_PROBE_PATHS.items():
+    for _path, _, _ in _probes:
+        if _path.endswith("log"):
+            PLUGIN_LOG_PATHS.add(_path)
+        elif _path.endswith(".php"):
+            # Wordfence data files open with __halt_compiler, its rules.php
+            # with a WFWAF_VERSION guard. Run by PHP either prints "Access
+            # denied"; only the source served as text carries the marker.
+            CONTENT_MARKERS[_path] = ("__halt_compiler", "wfwaf_version")
+
+# Requested directly, this core file calls a function nothing has loaded and
+# PHP stops. With display_errors on, the error names the file's full path.
+# Shipped without a direct-load guard from 4.9 to trunk (checked 2026-10-29).
+FPD_PATH = "/wp-includes/rss.php"
+FPD_RE = re.compile(
+    r"(?is)fatal error.*?((?:[a-z]:\\|/)[^\s<>\"']+[/\\]wp-includes[/\\]rss\.php)")
 
 # Paths that only mean something on WordPress. Skipped when the platform is
 # known not to be WordPress, so the appendix does not list forty WordPress
@@ -1527,6 +1575,19 @@ def content_matches(path: str, body: str) -> Optional[bool]:
         return bool(re.search(r"(?m)^[ \t]*(export[ \t]+)?[A-Za-z_][A-Za-z0-9_]*[ \t]*=", body))
     if path == "/.htpasswd":
         return bool(re.search(r"(?m)^[^:\s<>]+:[^\s:<>]{13,}[ \t]*$", body))
+    if path == FPD_PATH:
+        return bool(FPD_RE.search(body))
+    if path == "/wp-cli.yml":
+        return bool(re.search(
+            r"(?m)^(?:@[\w-]+|path|url|user|ssh|http|color|debug|quiet|require"
+            r"|disabled_commands|apache_modules|core|config|skip-plugins"
+            r"|skip-themes)\s*:", body))
+    if path in PLUGIN_LOG_PATHS:
+        return bool(PLUGIN_LOG_RE.search(body))
+    if path == "/.wp-env.json":
+        return body.lstrip().startswith("{") and any(
+            k in low for k in ('"core"', '"plugins"', '"themes"', '"port"',
+                               '"mappings"', '"config"'))
     markers = CONTENT_MARKERS.get(path)
     if markers is None:
         # No rule, but a bare HTML document at a non-HTML path is still not
@@ -1607,7 +1668,9 @@ def path_is_exposed(path: str, status: int, body: str,
     # one INFO line; not reporting it hides a truncated dump. check_paths()
     # keeps empties out of the severity bands for the same reason.
     if not body.strip():
-        return True
+        # Except where the evidence is what PHP prints: there, nothing
+        # printed is the safe answer.
+        return path != FPD_PATH
 
     # Where the file has a known shape, the body has to have it. A 200 with
     # the wrong content is a block page or a soft 404 the fingerprint missed.
@@ -1630,6 +1693,8 @@ def path_verdict(path: str, status: int, body: str, exposed: bool,
         return "rate limited"
     if exposed:
         return "readable" if body.strip() else "empty"
+    if path == FPD_PATH and status == 200 and not body.strip():
+        return "answered, nothing printed"
     if no_redirect_status and 300 <= no_redirect_status < 400:
         return "redirected (not a file)"
     if (status == 200 and body.strip() and not path.endswith("/")
@@ -1958,6 +2023,17 @@ def _robots_probe_rows(disallow: List[str]) -> List[Tuple[str, str, str]]:
     return out
 
 
+def detected_plugins(ctx: RunContext) -> set:
+    """Plugin slugs the site itself advertised: asset URLs, REST namespaces
+    and the homepage. Plugin-specific paths are requested only for these."""
+    assets = ctx.data("assets") or {}
+    rest = ctx.data("rest") or {}
+    headers = ctx.data("headers") or {}
+    return (set(assets.get("plugins") or {})
+            | set(rest.get("namespace_plugins") or {})
+            | set(headers.get("homepage_plugins") or []))
+
+
 def collect_paths(ctx: RunContext) -> Tuple[str, int, str]:
     """Request every path in PROBE_PATHS, redirect-aware and calibrated."""
     missing = ctx.missing_signature
@@ -1970,6 +2046,8 @@ def collect_paths(ctx: RunContext) -> Tuple[str, int, str]:
                       if "wp-" not in t[0] and t[0] not in WORDPRESS_ONLY_PATHS]
     probed = {p for p, _, _ in base_paths}
     extra = [t for t in _site_named_backups(ctx.site) if t[0] not in probed]
+    extra += [t for slug in sorted(detected_plugins(ctx) & PLUGIN_PROBE_PATHS.keys())
+              for t in PLUGIN_PROBE_PATHS[slug] if t[0] not in probed]
     probed |= {p for p, _, _ in extra}
     extra += [t for t in _robots_probe_rows(disallow) if t[0] not in probed]
     rows = []
@@ -2120,6 +2198,13 @@ def collect_headers(ctx: RunContext) -> Tuple[str, int, str]:
             match = re.search(r"<generator>[^<]*\?v=([^<\s]+)</generator>", feed)
             if match:
                 core_versions["feed"] = match.group(1).strip()
+        # The links OPML carries its own generator comment, which hardening
+        # that strips the homepage tag usually leaves in place.
+        o_status, _, opml = fetch(ctx.site + "/wp-links-opml.php")
+        if o_status == 200:
+            match = re.search(r'generator="WordPress/([^"\s]+)"', opml)
+            if match:
+                core_versions["opml"] = match.group(1).strip()
 
     themes = sorted(set(re.findall(r"/wp-content/themes/([^/\"']+)/", body)))
     theme_info = {}
@@ -2845,7 +2930,7 @@ def collect_vulns(ctx: RunContext) -> Tuple[str, int, str]:
     # site on 7.x, because 3.7.1 was jQuery's version. The generator tag and
     # the feed are written by WordPress itself.
     detected_core = ""
-    for key in ("generator (cache-busted)", "generator", "feed"):
+    for key in ("generator (cache-busted)", "generator", "feed", "opml"):
         if sources.get(key):
             detected_core = sources[key]
             break
@@ -3098,6 +3183,12 @@ def collect_transport(ctx: RunContext) -> Tuple[str, int, str]:
         "answering": xmlrpc_answering(status, body),
     }
 
+    # The login page shows a Register link only while "Anyone can register"
+    # is on. A renamed or blocked login page answers 404 and reads as closed.
+    status, _, body = fetch(ctx.site + "/wp-login.php")
+    data["registration"] = {"status": status,
+                            "open": registration_open(status, body)}
+
     status, _, body = fetch(ctx.site + "/.well-known/security.txt")
     data["security_txt"] = {"status": status,
                             "present": security_txt_present(status, body)}
@@ -3129,6 +3220,9 @@ def collect_transport(ctx: RunContext) -> Tuple[str, int, str]:
     notes = []
     if probes.count(0):
         notes.append(f"{probes.count(0)} of {len(probes)} requests got no answer")
+    if data["registration"]["status"] in UNMEASURED_STATUSES:
+        notes.append(f"wp-login.php answered HTTP {data['registration']['status']}, "
+                     "so open registration was not checked")
     if data["tls"].get("error") and not data["tls"].get("verify_error"):
         notes.append("TLS not measured: " + data["tls"]["error"])
     return ("partial" if notes else "ok"), 1, "; ".join(notes)
@@ -3138,6 +3232,21 @@ def xmlrpc_answering(status: int, body: str) -> bool:
     """Is xmlrpc.php the live WordPress endpoint? Its GET refusal names
     itself; a bare 405 from a WAF does not."""
     return status in (200, 405) and "xml-rpc server accepts" in body.lower()
+
+
+def registration_open(status: int, body: str) -> bool:
+    """Does the login page offer a Register link? WordPress prints one only
+    when users_can_register is on; esc_url writes the & as &#038;."""
+    return status == 200 and bool(re.search(
+        r"href=[\"'][^\"']*[?&](?:amp;|#038;)?action=register\b", body))
+
+
+def wpcom_unclaimed(body: str) -> bool:
+    """Is this WordPress.com's page for a site name nobody holds? The two
+    phrases are the nuclei-templates wordpress-takeover matchers."""
+    low = body.lower()
+    return bool(re.search(r"do you want to register\s*(?:<em>)?[\w.-]+\.wordpress\.com", low)
+                or ".wordpress.com</em> doesn&#8217;t&nbsp;exist" in low)
 
 
 def cookie_flags(set_cookie: str) -> Dict[str, bool]:
@@ -3239,6 +3348,14 @@ def collect_dns(ctx: RunContext) -> Tuple[str, int, str]:
                 data["dmarc_parent_record"] = found[0]
                 break
     data["mx"] = _dns_mx(domain)
+    # A host name still pointing at a WordPress.com site that was deleted
+    # can be claimed by whoever registers that name there.
+    data["host"] = host
+    data["cname"] = _dns_cname(host)
+    data["wpcom_unclaimed"] = False
+    if data["cname"].lower().endswith(".wordpress.com"):
+        _, _, body = fetch(ctx.site + "/")
+        data["wpcom_unclaimed"] = wpcom_unclaimed(body)
     ctx.write("dns", data)
     return "ok", 1, ""
 
@@ -3328,17 +3445,21 @@ MODULES: List[Dict] = [
      "about": "Requests backup archives, database dumps, credential files, "
               "logs, developer artefacts, form-upload directories and "
               "directory listings that should not be readable, plus backup "
-              "names derived from the domain and the paths robots.txt hides."},
+              "names derived from the domain, the paths robots.txt hides, "
+              "log and data files of plugins the site advertises, and a "
+              "core file that shows whether PHP prints errors to visitors."},
     {"key": "transport", "title": "Transport and TLS",
      "fn": collect_transport, "required": False,
-     "about": "HTTP-to-HTTPS behaviour, the certificate, CORS, XML-RPC and "
-              "security.txt."},
-    {"key": "dns", "title": "Mail spoofing posture",
+     "about": "HTTP-to-HTTPS behaviour, the certificate, CORS, XML-RPC, "
+              "open account registration and security.txt."},
+    {"key": "dns", "title": "Mail spoofing and DNS posture",
      "fn": collect_dns, "required": False,
      "about": "SPF, DMARC and MX for the website domain, which is the half "
               "nobody owns when it differs from the mail domain. The MX "
               "records are read to tell a domain that sends no mail from one "
-              "whose SPF record forgot its senders."},
+              "whose SPF record forgot its senders. The site's host name is "
+              "checked for a CNAME to a WordPress.com site that no longer "
+              "exists."},
 ]
 
 MODULE_BY_KEY = {m["key"]: m for m in MODULES}
@@ -3684,7 +3805,7 @@ def check_headers(ctx: RunContext) -> List[Finding]:
         # report that leads with a stale number gets its other numbers
         # doubted too.
         sources = data.get("core_versions") or {}
-        live = next((sources[k] for k in ("generator (cache-busted)", "feed")
+        live = next((sources[k] for k in ("generator (cache-busted)", "feed", "opml")
                      if sources.get(k)), "")
         cached = sources.get("generator", "")
         stale = bool(live and cached and live != cached)
@@ -4687,6 +4808,23 @@ def check_transport(ctx: RunContext) -> List[Finding]:
             [{"URL": ctx.site + "/xmlrpc.php", "Status": "answering"}],
             "transport.json"))
 
+    if data.get("registration", {}).get("open"):
+        findings.append(Finding(
+            "transport-registration", "MEDIUM",
+            "Anyone can create an account on this site",
+            "The login page offers a Register link, which WordPress shows "
+            "only while Settings > General > Membership > Anyone can register "
+            "is on. Each new account gets the default role, normally "
+            "Subscriber. Many published plugin vulnerabilities need only a "
+            "logged-in Subscriber, so open registration turns them from "
+            "\"needs an account\" into \"needs an email address\". A site "
+            "with a members' area may need this on purpose.",
+            "If visitors do not need accounts, untick Anyone can register. "
+            "If they do, confirm the New User Default Role on the same screen "
+            "is Subscriber and nothing higher, and keep plugins current.",
+            [{"URL": ctx.site + "/wp-login.php",
+              "Status": "Register link offered"}], "transport.json"))
+
     if data.get("cors") == "*":
         findings.append(Finding(
             "transport-cors", "MEDIUM",
@@ -4752,6 +4890,21 @@ def check_dns(ctx: RunContext) -> List[Finding]:
         return []
     findings = []
     domain = data.get("domain", "")
+    if data.get("wpcom_unclaimed"):
+        findings.append(Finding(
+            "dns-wpcom-takeover", "HIGH",
+            f"{data.get('host', domain)} points at a WordPress.com site that "
+            "does not exist",
+            f"The host name's CNAME record points at {data.get('cname')}, and "
+            "WordPress.com answers that no site by that name exists. Whoever "
+            "registers that name on WordPress.com may be able to publish "
+            "their own pages on this host name.",
+            "Delete the CNAME record if the site has moved, or point it at "
+            "the live site. If the WordPress.com site is still wanted, "
+            "re-create it under that name.",
+            [{"Record": "CNAME", "Value": data.get("cname", "")},
+             {"Record": "WordPress.com", "Value": "no site by that name"}],
+            "dns.json"))
     parent = data.get("dmarc_parent", "")
     parent_record = data.get("dmarc_parent_record", "")
     parent_policy = ""
@@ -4951,7 +5104,7 @@ def _profile_block(ctx: RunContext) -> str:
     # so the summary and the finding headline agree.
     core_versions = headers.get("core_versions") or {}
     live_core = next((core_versions[k] for k in
-                      ("generator (cache-busted)", "feed") if core_versions.get(k)), "")
+                      ("generator (cache-busted)", "feed", "opml") if core_versions.get(k)), "")
     add("Platform", ", ".join(
         f"WordPress {live_core}"
         if live_core and g.lower().startswith("wordpress") else g
@@ -6443,6 +6596,91 @@ def selftest() -> int:
                   "demo" in data["plugins"], True)
     finally:
         g["fetch"] = saved_fetch
+
+    # nuclei-derived checks: content shape, PHP-printed evidence, gating.
+    wf = "/wp-content/wflogs/config.php"
+    check("wflogs: source served as text is readable",
+          path_is_exposed(wf, 200, "<?php exit('Access denied'); __halt_compiler(); ?>\na:1:{s:7:\"authKey\";}", None, 200), True)
+    check("wflogs: PHP running the file is not",
+          path_is_exposed(wf, 200, "Access denied", None, 200), False)
+    fatal = ("<br />\n<b>Fatal error</b>: Uncaught Error: Call to undefined "
+             "function _deprecated_file() in /home/u1/public_html/wp-includes/rss.php:19")
+    check("fpd: a fatal error naming the path is reported",
+          path_is_exposed(FPD_PATH, 200, fatal, None, 200), True)
+    check("fpd: an empty 200 is display_errors off, not a finding",
+          path_is_exposed(FPD_PATH, 200, "", None, 200), False)
+    check("fpd: a 200 without a path is not a finding",
+          path_is_exposed(FPD_PATH, 200, "Forbidden by policy", None, 200), False)
+    check("wp-cli.yml: YAML keys pass, prose does not",
+          (content_matches("/wp-cli.yml", "path: wp\nurl: https://x.test\n"),
+           content_matches("/wp-cli.yml", "Request blocked")), (True, False))
+    check("wp-env: JSON with wp-env keys passes, other JSON does not",
+          (content_matches("/.wp-env.json", '{"core": null, "plugins": ["."]}'),
+           content_matches("/.wp-env.json", '{"error": "denied"}')), (True, False))
+    check("registration: link present is open, absent is closed",
+          (registration_open(200, '<a href="https://x.test/wp-login.php?action=register">Register</a>'),
+           registration_open(200, '<a href="https://x.test/wp-login.php?action=lostpassword">'),
+           registration_open(404, 'action=register"')), (True, False, False))
+    check("wpcom takeover: unclaimed page detected, live site not",
+          (wpcom_unclaimed("<p>Do you want to register <em>x.wordpress.com</em>?</p>"),
+           wpcom_unclaimed("<h1>My blog</h1>")), (True, False))
+    check("wflogs: rules.php source carries the WFWAF guard",
+          content_matches("/wp-content/wflogs/rules.php",
+                          "<?php\nif (!defined('WFWAF_VERSION')) {\n\texit('Access denied');"), True)
+    check("fpd: an error page echoing the request path is not a disclosure",
+          path_is_exposed(FPD_PATH, 200, "Fatal error: the page /wp-includes/rss.php could not be served", None, 200), False)
+    check("fpd: empty answer says so in the appendix",
+          path_verdict(FPD_PATH, 200, "", False, 200), "answered, nothing printed")
+    check("wp-cli.yml: a plain-text block page is not the config",
+          content_matches("/wp-cli.yml", "Error: Request blocked by policy"), False)
+    log = "/wp-content/uploads/EnableMediaReplace.log"
+    check("plugin log: a log line passes, a block page does not",
+          (content_matches(log, "[2026-10-01 10:00:01] Replaced file 12"),
+           content_matches(log, "Access Denied [403]")), (True, False))
+    check("registration: esc_url's &#038; form is still a link",
+          registration_open(200, '<a href="/wp-login.php?lang=en&#038;action=register">'), True)
+    check("wpcom takeover: a live site asking visitors to register is not unclaimed",
+          wpcom_unclaimed("<h1>Camp 2026</h1><p>Do you want to register for camp?</p>"), False)
+    saved = {k: g[k] for k in ("fetch", "fetch_no_redirect", "_dns_cname", "_dns_txt", "_dns_mx")}
+    try:
+        g["_dns_txt"] = lambda name: []
+        g["_dns_mx"] = lambda name: []
+        g["fetch"] = lambda url, **k: (404, {}, "<p>Do you want to register <em>gone.wordpress.com</em>?</p>")
+        for cname, want in (("gone.wordpress.com", ["dns-wpcom-takeover"]), ("x.example.net", [])):
+            g["_dns_cname"] = lambda name, c=cname: c if name == "x.test" else ""
+            with tempfile.TemporaryDirectory() as tmp:
+                ctx = RunContext(Path(tmp), argparse.Namespace(url=[], site="https://x.test"))
+                collect_dns(ctx)
+                check(f"wpcom takeover: CNAME {cname}",
+                      [f.fid for f in check_dns(ctx) if f.fid == "dns-wpcom-takeover"], want)
+        opml = '<?xml version="1.0"?>\n<opml version="1.0"><head><!-- generator="WordPress/6.8.3" -->'
+        g["fetch"] = lambda url, **k: ((200, {}, opml) if "opml" in url else
+                                       (200, {}, '<meta name="generator" content="WordPress 6.8.3">'))
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx = RunContext(Path(tmp), argparse.Namespace(url=[], site="https://x.test"))
+            collect_headers(ctx)
+            check("opml: the generator comment is a core version source",
+                  ctx.data("headers")["core_versions"].get("opml"), "6.8.3")
+    finally:
+        g.update(saved)
+    saved = {k: g[k] for k in ("fetch", "fetch_no_redirect")}
+    asked: List[str] = []
+    try:
+        g["fetch"] = lambda url, **k: (asked.append(url), (404, {}, ""))[1]
+        g["fetch_no_redirect"] = lambda url, **k: (404, {})
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx = RunContext(Path(tmp), argparse.Namespace(url=[], site="https://x.test"))
+            ctx.write("headers", {"homepage_plugins": ["wordfence"]})
+            ctx.write("rest", {"namespace_plugins": {"gravityforms": {}}})
+            ctx.write("assets", {"plugins": {"wp-statistics": {}}})
+            collect_paths(ctx)
+            check("plugin paths: only advertised plugins are probed",
+                  (any("/wflogs/config.php" in u for u in asked),
+                   any("/gravityforms/debug.log" in u for u in asked),
+                   any("/wp-statistics/debug.log" in u for u in asked),
+                   any("/newsletter/" in u for u in asked)), (True, True, True, False))
+    finally:
+        g.update(saved)
 
     # Exit-code and resume guards in main().
     with tempfile.TemporaryDirectory() as tmp:

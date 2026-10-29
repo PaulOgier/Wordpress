@@ -95,16 +95,16 @@ Eleven modules. `--list` prints this with descriptions.
 | Key | Area |
 |---|---|
 | `calibration` | How the site answers a path that cannot exist, plus a control proving the result still lets real files through |
-| `headers` | Whether this is WordPress at all, what sits in front of it (CDN, WAF, managed host), security response headers, cookie flags, mixed content, the core version from three independent sources, the theme and its version from `style.css` |
-| `paths` | Fifty-odd backup archives, database dumps, credential files, logs, developer artefacts, form-upload directories and directory listings, plus backup names derived from the site's own domain and the paths its `robots.txt` asks crawlers to avoid |
+| `headers` | Whether this is WordPress at all, what sits in front of it (CDN, WAF, managed host), security response headers, cookie flags, mixed content, the core version from four independent sources, the theme and its version from `style.css` |
+| `paths` | Fifty-odd backup archives, database dumps, credential files, logs, developer artefacts, form-upload directories and directory listings, plus backup names derived from the site's own domain, the paths its `robots.txt` asks crawlers to avoid, log and data files of plugins the site advertises (Wordfence `wflogs`, plugin error logs), `.wp-env.json`, `wp-cli.yml`, the W3 Total Cache database cache, and whether PHP prints errors with file paths to visitors |
 | `rest` | `/wp-json/` (or `/?rest_route=/` where pretty permalinks are off) plugin inventory, any route accepting a write method, and `readme.txt` versions for plugins known only from their namespace |
 | `users` | The four routes that publish account names |
 | `media` | The whole media library, walked and reconciled against the reported total |
 | `documents` | Each document resolved, filenames triaged |
 | `assets` | Plugin versions from cache-busted asset URLs across the sitemap, cross-checked against each plugin's `readme.txt` |
 | `vulns` | Every detected plugin, theme, core and PHP version looked up for currency, withdrawal from the directory and published CVEs, plus PHP branches past end of life |
-| `transport` | HTTP-to-HTTPS, TLS, CORS, XML-RPC, `wp-cron.php`, `security.txt` |
-| `dns` | SPF and DMARC for the website domain, including the DMARC policy a subdomain inherits |
+| `transport` | HTTP-to-HTTPS, TLS, CORS, XML-RPC, `wp-cron.php`, open account registration, `security.txt` |
+| `dns` | SPF and DMARC for the website domain, including the DMARC policy a subdomain inherits, and a CNAME to a WordPress.com site that no longer exists |
 
 The WordPress-specific modules (`rest`, `users`, `media`, `documents`,
 `assets`, `vulns`) are marked **not applicable** rather than run when no
