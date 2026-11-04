@@ -90,21 +90,23 @@ unknown. It does not find out. Finding out means submitting.
 
 ## What it checks
 
-Eleven modules. `--list` prints this with descriptions.
+Thirteen modules. `--list` prints this with descriptions.
 
 | Key | Area |
 |---|---|
 | `calibration` | How the site answers a path that cannot exist, plus a control proving the result still lets real files through |
-| `headers` | Whether this is WordPress at all, what sits in front of it (CDN, WAF, managed host), security response headers, cookie flags, mixed content, the core version from four independent sources, the theme and its version from `style.css` |
-| `paths` | Fifty-odd backup archives, database dumps, credential files, logs, developer artefacts, form-upload directories and directory listings, plus backup names derived from the site's own domain, the paths its `robots.txt` asks crawlers to avoid, log and data files of plugins the site advertises (Wordfence `wflogs`, plugin error logs), `.wp-env.json`, `wp-cli.yml`, the W3 Total Cache database cache, and whether PHP prints errors with file paths to visitors |
+| `headers` | Whether this is WordPress at all, what sits in front of it (CDN, WAF, managed host), security response headers and what the Content-Security-Policy actually restricts, cookie flags, mixed content, the core version from four independent sources, the theme and its version from `style.css` |
+| `paths` | Nearly seventy backup archives, database dumps, credential files, logs, developer artefacts, form-upload directories and directory listings, plus backup names derived from the site's own domain, the paths its `robots.txt` asks crawlers to avoid, log and data files of plugins the site advertises (Wordfence `wflogs`, plugin error logs), `.wp-env.json`, `wp-cli.yml`, the W3 Total Cache database cache, leftover migration and password-reset tools (`searchreplacedb2.php`, `emergency.php`, the Duplicator installer log), editor and deployment files with server logins, Docker files, lock files, Vim swap files of `wp-config.php`, readable `.htaccess`, the database repair page when switched on, upload folders of advertised plugins, each advertised plugin's folder listing, whether PHP prints errors with file paths to visitors, and whether PHP is switched off so source files are served as text |
 | `rest` | `/wp-json/` (or `/?rest_route=/` where pretty permalinks are off) plugin inventory, any route accepting a write method, and `readme.txt` versions for plugins known only from their namespace |
-| `users` | The four routes that publish account names |
+| `users` | The routes that publish account names: REST, `?author=1` to 10, the users sitemap, an SEO plugin's author sitemap, homepage author links, the feed and oEmbed |
 | `media` | The whole media library, walked and reconciled against the reported total |
 | `documents` | Each document resolved, filenames triaged |
-| `assets` | Plugin versions from cache-busted asset URLs across the sitemap, cross-checked against each plugin's `readme.txt` |
-| `vulns` | Every detected plugin, theme, core and PHP version looked up for currency, withdrawal from the directory and published CVEs, plus PHP branches past end of life |
-| `transport` | HTTP-to-HTTPS, TLS, CORS, XML-RPC, `wp-cron.php`, open account registration, `security.txt` |
-| `dns` | SPF and DMARC for the website domain, including the DMARC policy a subdomain inherits, and a CNAME to a WordPress.com site that no longer exists |
+| `assets` | Plugin versions from cache-busted asset URLs across the sitemap, cross-checked against each plugin's `readme.txt`, third-party scripts and stylesheets loaded without Subresource Integrity, credential-shaped strings in pages and first-party scripts (shown masked), and PHP errors printed into pages |
+| `vulns` | Every detected plugin, theme, core and PHP version looked up for currency, withdrawal from the directory and published CVEs, plus PHP branches past end of life or past active support |
+| `transport` | HTTP-to-HTTPS, TLS including whether 1.0 and 1.1 are still accepted, the www or bare form of the host, the login form over HTTP and its cookies, CORS, XML-RPC, GraphQL, `wp-cron.php`, open account registration, `security.txt` |
+| `dns` | SPF and DMARC for the website domain, including the DMARC policy a subdomain inherits, a CNAME to a WordPress.com site that no longer exists, CAA records, DNSSEC validation, SPF lookup count and `+all`, DMARC reporting, MTA-STS, TLS-RPT and BIMI |
+| `integrity` | Signs of compromise: the homepage and two sitemap pages compared as a browser, a search crawler and a visitor from a search result; injected markup (hidden iframes and links, encoded scripts, spam links); a signed-in view served from cache; static core files compared with wordpress.org checksums; sitemap URL count against the last run, spam-word URLs |
+| `privacy` | Consent tools, trackers and how they load, cookies set before consent, what the privacy policy mentions (POPIA, GDPR, CCPA and others), consent wording on forms, third-party embeds and fonts, dead tags, and where the site's address is allocated. Reported in its own section, never above low, never a compliance verdict |
 
 The WordPress-specific modules (`rest`, `users`, `media`, `documents`,
 `assets`, `vulns`) are marked **not applicable** rather than run when no
@@ -114,6 +116,41 @@ content, TLS, HTTP redirect, CORS, mail DNS, `security.txt`, and the generic
 half of the path list (`.env`, `.git`, backups, `phpinfo.php` and the rest).
 What it does not do on any site is send a payload, so cross-site scripting,
 injection and anything behind a login are out of scope by design.
+
+The report also states how many requests the run made, at what rate and how many were refused, and lists the security plugins visible from outside. Hygiene findings cover discussion settings, attachment pages, a theme customised without a child theme, little-used or duplicate plugins, HSTS strength and a canonical address on another host.
+
+The report opens with what changed since the previous run of the same host (also written to `diff.json`) and a short list of findings to do first. Findings with a standard fix carry a collapsed, paste-ready snippet for Apache, nginx, Cloudflare or WordPress; test those on staging first.
+
+### Checks this tool does not run, and why
+
+- **Unsafe HTTP methods.** Testing them means sending PUT and DELETE. A
+  WordPress front controller answers them with the homepage, which is why
+  other scanners report them as 200 with the homepage's exact byte count.
+- **GraphQL introspection, password attacks and login-error username
+  confirmation.** All three need a POST.
+- **Aggressive plugin and theme discovery.** Guessing thousands of paths.
+  This tool reads only what the site advertises.
+- **TLS cipher grading.** Use SSL Labs. The tool checks validity, expiry and
+  old protocol versions only.
+- **Blocklist and reputation lookups.** Third-party services that need keys.
+
+### When another scanner disagrees
+
+Five patterns seen when this report was compared against other scanners on
+the same site:
+
+- **The WordPress licence file reported as a debug file.** `license.txt` ships
+  with every install. This report lists it as LOW because it confirms the
+  platform and can narrow the version, not as a debug file.
+- **A plugin version read from one stylesheet's `?ver=`.** A file versioned
+  3.0 inside a plugin at 6.x was reported as the plugin being at 3.0. This
+  tool cross-checks asset versions against the plugin's own `readme.txt`.
+- **A vulnerability listed for a plugin whose version could not be read.**
+  "Version not found" next to a vulnerability is a possibility, not a
+  finding.
+- **PHP active-support end reported as end of life.** A branch past active
+  support still receives security fixes; this report gives both dates.
+- **PUT and DELETE "enabled".** See the first exclusion above.
 
 ### The things it gets right that a naive check does not
 
@@ -141,6 +178,19 @@ query string and the cache header is recorded beside the number. And one page
 is not the site: reading a single page on one live site reported a form plugin
 as present on one page when it was on 41, understating the public surface of a
 vulnerable plugin by a factor of forty.
+
+**WordPress's own version on a plugin's file is not the plugin's version.** A
+plugin that enqueues a file without a version gets `?ver=` set to the WordPress
+version. Read as the plugin's, that makes it look current and can clear a real
+vulnerability. The core version is dropped from each plugin's readings, and a
+plugin left with nothing is treated as version unknown.
+
+**A Cloudflare script on a normal page is not a challenge page.** Cloudflare's
+JavaScript Detections puts a `/cdn-cgi/challenge-platform/` script into every
+HTML page, and Bot Fight Mode turns it on. A small homepage could then be read
+as a block page and lose its header findings. Body markers count only on a
+non-200. `cf-mitigated: challenge`, which Cloudflare sets on every challenge
+page, and Sucuri's `sucuri_cloudproxy_js` count on any status.
 
 **Two sources are used for vulnerabilities, and they are trusted for
 different things.** `api.wordpress.org` is first-party and authoritative for
@@ -350,6 +400,15 @@ python3 wp_audit.py --run-dir wp_audit_runs/www_example_com_20260903_190000 \
 python3 wp_audit.py --run-dir wp_audit_runs/www_example_com_20260903_190000 \
     --render-only --standalone
 
+# Several sites, one after another, with a summary page.
+python3 wp_audit.py --sites clients.txt
+
+# Findings as JSON on stdout for a pipeline; messages go to stderr.
+python3 wp_audit.py --site https://example.com --format json --no-open > findings.json
+
+# Leave out the privacy section.
+python3 wp_audit.py --site https://example.com --skip privacy
+
 # Scheduled, gated on severity.
 python3 wp_audit.py --site https://www.example.com --no-open --no-colour \
     || echo "critical or high findings, or an incomplete run; see the report"
@@ -360,7 +419,11 @@ python3 wp_audit.py --site https://www.example.com --no-open --no-colour \
 Modules run in order and each writes its own JSON as it completes, so an
 interrupted run keeps everything it collected. Ctrl-C stops after the current
 request rather than mid-write; a second Ctrl-C aborts immediately. Re-running
-with `--run-dir` skips whatever already finished.
+with `--run-dir` skips whatever already finished. `--only` with `--force`
+redoes only the modules it names. Every other module keeps its status.
+Each module's entry in `manifest.json` records the tool version and a hash of
+the script that wrote it. A run re-collected across versions shows which code
+produced each part.
 
 A module that raises does not end the run. It is recorded as `error` with the
 exception, and it appears in the report's Coverage gaps table so absence from
@@ -370,7 +433,7 @@ Calibration is the one module that can stop another. If its control check
 fails, the paths module is skipped rather than run against a signature that
 would suppress real findings, and the report says so.
 
-Typical timings on a small site: 3 to 5 minutes, most of it in `paths` (43
+Typical timings on a small site: 3 to 5 minutes, most of it in `paths` (69
 requests, each made twice so the redirect is visible) and `assets` (up to 80
 sitemap pages).
 
@@ -416,7 +479,7 @@ sitemap pages).
 python3 wp_audit.py --selftest
 ```
 
-About 140 assertions against synthetic responses, no network. They cover the
+About 390 assertions against synthetic responses, no network. They cover the
 shapes that have each produced a wrong report: the redirecting site, the soft
 404 that echoes the requested path, the unstable 404 that cannot be
 calibrated, the installer that answers on every site, the WAF challenge page
