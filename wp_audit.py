@@ -188,6 +188,7 @@ Example usage:
   python3 wp_audit.py --selftest
 """
 
+from __future__ import annotations
 import argparse
 import hashlib
 import json
